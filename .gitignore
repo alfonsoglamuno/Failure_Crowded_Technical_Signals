@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Data — never commit raw or processed market data
+data/raw/
+data/processed/
+data/features/
+*.csv
+*.parquet
+*.feather
+*.h5
+*.hdf5
+
+# Models — large artifacts belong in object storage
+results/models/*.pkl
+results/models/*.joblib
+results/models/*.json
+results/models/*.bin
+
+# Environment
+.env
+.env.local
+*.env
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+
+# Logs
+logs/
+*.log
+
+# Config with secrets
+configs/secrets.yaml

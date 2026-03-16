@@ -1,0 +1,39 @@
+# Core data
+pandas>=2.0
+numpy>=1.24
+pyarrow>=12.0
+
+# Market data
+yfinance>=0.2.40
+
+# Technical indicators
+ta>=0.11           # Technical Analysis library
+pandas-ta>=0.3.14b # Extended TA library
+
+# Machine learning
+scikit-learn>=1.4
+xgboost>=2.0
+lightgbm>=4.3
+
+# Model calibration / evaluation
+shap>=0.45
+
+# Backtesting
+vectorbt>=0.26
+
+# Visualisation
+matplotlib>=3.8
+seaborn>=0.13
+plotly>=5.20
+
+# Notebooks
+jupyter>=1.0
+ipywidgets>=8.0
+
+# Config
+pyyaml>=6.0
+python-dotenv>=1.0
+
+# Utilities
+tqdm>=4.66
+joblib>=1.3
