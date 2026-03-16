@@ -17,9 +17,12 @@ build/
 *.ipynb_checkpoints
 
 # Data — never commit raw or processed market data
-data/raw/
-data/processed/
-data/features/
+data/raw/*
+data/processed/*
+data/features/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/features/.gitkeep
 *.csv
 *.parquet
 *.feather
@@ -27,10 +30,10 @@ data/features/
 *.hdf5
 
 # Models — large artifacts belong in object storage
-results/models/*.pkl
-results/models/*.joblib
-results/models/*.json
-results/models/*.bin
+results/models/*
+results/reports/*
+!results/models/.gitkeep
+!results/reports/.gitkeep
 
 # Environment
 .env
@@ -49,7 +52,8 @@ desktop.ini
 *.swo
 
 # Logs
-logs/
+logs/*
+!logs/.gitkeep
 *.log
 
 # Config with secrets
