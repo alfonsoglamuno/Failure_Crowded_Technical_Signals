@@ -24,7 +24,7 @@ def compute_forward_returns(
     for ticker, grp in panel.groupby("ticker"):
         idx = grp.index
         for h in horizons:
-            fwd = grp["close"].pct_change(h).shift(-h)
+            fwd = grp["close"].shift(-h) / grp["close"] - 1
             panel.loc[idx, f"fwd_ret_{h}d"] = fwd
     return panel
 

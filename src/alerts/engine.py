@@ -149,7 +149,7 @@ def alert_atr_spike(
 # Main entry point
 # ---------------------------------------------------------------------------
 
-ALERT_REGISTRY: dict[str, tuple[str, callable]] = {
+ALERT_REGISTRY: dict[str, tuple[str, "Callable"]] = {
     # name: (direction, function)
     "breakout_high_20":    ("bullish", lambda d: alert_breakout_high(d["close"], 20)),
     "breakout_high_50":    ("bullish", lambda d: alert_breakout_high(d["close"], 50)),
@@ -163,8 +163,8 @@ ALERT_REGISTRY: dict[str, tuple[str, callable]] = {
     "rsi_oversold":        ("bullish", lambda d: alert_rsi_oversold(d["close"])),
     "macd_bullish":        ("bullish", lambda d: alert_macd_bullish(d["close"])),
     "macd_bearish":        ("bearish", lambda d: alert_macd_bearish(d["close"])),
-    "bb_breakout_up":      ("bearish", lambda d: alert_bb_breakout_up(d["close"])),
-    "bb_breakout_down":    ("bullish", lambda d: alert_bb_breakout_down(d["close"])),
+    "bb_breakout_up":      ("bullish", lambda d: alert_bb_breakout_up(d["close"])),
+    "bb_breakout_down":    ("bearish", lambda d: alert_bb_breakout_down(d["close"])),
     "volume_spike":        ("neutral", lambda d: alert_volume_spike(d["volume"])),
     "atr_spike":           ("neutral", lambda d: alert_atr_spike(d["high"], d["low"], d["close"])),
     "gap_up":              ("bullish", lambda d: alert_gap_up(d["open"], d["close"])),

@@ -27,14 +27,18 @@ class WalkForwardConfig:
     test_fraction: float = 0.2
 
 
-def get_model(name: str, random_state: int = 42, **kwargs) -> Any:
+def get_model(name: str, random_state: int = 42, scale_pos_weight: float = 1.0, **kwargs) -> Any:
     models = {
         "logistic": Pipeline([
             ("scaler", StandardScaler()),
-            ("clf", LogisticRegression(max_iter=1000, random_state=random_state, **kwargs)),
+            ("clf", LogisticRegression(
+                max_iter=1000, random_state=random_state,
+                class_weight="balanced", **kwargs
+            )),
         ]),
         "random_forest": RandomForestClassifier(
-            n_estimators=300, random_state=random_state, n_jobs=-1, **kwargs
+            n_estimators=300, random_state=random_state, n_jobs=-1,
+            class_weight="balanced", **kwargs
         ),
         "xgboost": XGBClassifier(
             n_estimators=500,
@@ -42,10 +46,10 @@ def get_model(name: str, random_state: int = 42, **kwargs) -> Any:
             learning_rate=0.05,
             subsample=0.8,
             colsample_bytree=0.8,
-            use_label_encoder=False,
             eval_metric="logloss",
             random_state=random_state,
             n_jobs=-1,
+            scale_pos_weight=scale_pos_weight,
             **kwargs,
         ),
     }
@@ -80,7 +84,8 @@ def make_walk_forward_splits(
         test_start_date = sorted_dates[test_start_idx]
         test_end_date = sorted_dates[test_end_idx - 1]
 
-        # Training indices: everything before test, minus purge/embargo buffer
+        # Purge: remove training samples whose label horizon bleeds into test period.
+        # embargo_days acts as a calendar gap; purge_days should equal the label horizon.
         cutoff_date = test_start_date - np.timedelta64(cfg.embargo_days + cfg.purge_days, "D")
         train_mask = dates < cutoff_date
         test_mask = (dates >= test_start_date) & (dates <= test_end_date)
@@ -113,6 +118,8 @@ def train_evaluate(
     all_preds = []
     all_true = []
     all_dates = []
+    all_orig_idx = []   # original DataFrame row indices for precise backtest mapping
+    all_importances = []
 
     for fold_i, (train_idx, test_idx) in enumerate(splits):
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
@@ -130,17 +137,35 @@ def train_evaluate(
             logger.warning("Fold %d: empty split, skipping.", fold_i)
             continue
 
-        model = get_model(model_name)
+        # Scale pos weight to handle class imbalance
+        neg = (y_train == 0).sum()
+        pos = (y_train == 1).sum()
+        spw = neg / pos if pos > 0 else 1.0
+
+        model = get_model(model_name, scale_pos_weight=spw)
         model.fit(X_train.fillna(0), y_train)
 
         proba = model.predict_proba(X_test.fillna(0))[:, 1]
         all_preds.extend(proba)
         all_true.extend(y_test.values)
         all_dates.extend(d_test.values)
-        logger.info("Fold %d: train=%d, test=%d", fold_i, len(y_train), len(y_test))
+        all_orig_idx.extend(X_test.index.tolist())   # preserve original row index
+        logger.info("Fold %d: train=%d, test=%d  spw=%.2f", fold_i, len(y_train), len(y_test), spw)
+
+        # Collect feature importances (XGBoost and RF only)
+        clf = model.named_steps["clf"] if hasattr(model, "named_steps") else model
+        if hasattr(clf, "feature_importances_"):
+            all_importances.append(
+                pd.Series(clf.feature_importances_, index=X_train.columns)
+            )
 
     return {
         "dates": all_dates,
         "y_true": all_true,
         "y_pred_proba": all_preds,
+        "orig_idx": all_orig_idx,
+        "feature_importance": (
+            pd.concat(all_importances, axis=1).mean(axis=1).sort_values(ascending=False)
+            if all_importances else None
+        ),
     }

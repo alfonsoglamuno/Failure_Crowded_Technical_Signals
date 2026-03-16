@@ -32,7 +32,7 @@ def add_return_features(df: pd.DataFrame, windows: list[int]) -> pd.DataFrame:
 def add_ma_distance_features(df: pd.DataFrame) -> pd.DataFrame:
     for w in [10, 20, 50, 100, 200]:
         ma = df["close"].rolling(w).mean()
-        df[f"dist_ma{w}"] = (df["close"] - ma) / ma
+        df[f"dist_ma{w}"] = (df["close"] - ma) / ma.replace(0, np.nan)
     return df
 
 
@@ -77,8 +77,12 @@ def add_volume_features(df: pd.DataFrame, windows: list[int]) -> pd.DataFrame:
     df["ret_vol_interaction"] = df["close"].pct_change().abs() * _volume_zscore(df["volume"])
     # Consecutive up/down sessions
     ret = df["close"].pct_change()
-    df["consec_up"] = ret.gt(0).astype(int).groupby((ret.le(0)).cumsum()).cumcount()
-    df["consec_down"] = ret.lt(0).astype(int).groupby((ret.ge(0)).cumsum()).cumcount()
+    # +1 so a single qualifying day = 1, not 0
+    df["consec_up"] = ret.gt(0).astype(int).groupby((ret.le(0)).cumsum()).cumcount() + 1
+    df["consec_down"] = ret.lt(0).astype(int).groupby((ret.ge(0)).cumsum()).cumcount() + 1
+    # Zero out the count on non-qualifying days
+    df.loc[ret.le(0), "consec_up"] = 0
+    df.loc[ret.ge(0), "consec_down"] = 0
     return df
 
 

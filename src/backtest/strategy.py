@@ -81,4 +81,7 @@ def compare_strategies(
     except ValueError:
         s3 = pd.Series(dtype=float, name=f"ml_filtered_h{horizon}")
 
-    return pd.DataFrame({s1.name: s1, s2.name: s2, s3.name: s3})
+    return pd.concat(
+        [s1.rename("follow_alert"), s2.rename("blind_inverse"), s3.rename("ml_filtered")],
+        axis=1,
+    )

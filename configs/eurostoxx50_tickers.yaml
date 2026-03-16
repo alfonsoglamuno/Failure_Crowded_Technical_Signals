@@ -6,15 +6,14 @@ tickers:
   - "AD.AS"    # Ahold Delhaize
   - "AIR.PA"   # Airbus
   - "ALV.DE"   # Allianz
-  - "AMS.PA"   # Air Liquide (L'Air Liquide)
+  - "AI.PA"    # Air Liquide (L'Air Liquide)
   - "ASML.AS"  # ASML
-  - "AXA.PA"   # AXA
+  - "CS.PA"    # AXA
   - "BAS.DE"   # BASF
   - "BAYN.DE"  # Bayer
   - "BMW.DE"   # BMW
   - "BNP.PA"   # BNP Paribas
   - "CRH.L"    # CRH
-  - "CS.PA"    # AXA (duplicate check)
   - "DB1.DE"   # Deutsche Börse
   - "DHL.DE"   # DHL Group (Deutsche Post)
   - "DTE.DE"   # Deutsche Telekom
