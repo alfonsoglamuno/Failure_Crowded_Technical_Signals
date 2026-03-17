@@ -257,6 +257,63 @@ def add_intraday_structure_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Block I — trend and momentum features
+# ---------------------------------------------------------------------------
+# Literature grounding:
+#   Jegadeesh & Titman (1993): 3-12m momentum predicts returns.
+#   Lo & MacKinlay (1988): short-term return autocorrelation in daily data.
+#   RSI slope / MACD are leading indicators of momentum inflection.
+#   Vol acceleration (short/long vol ratio) flags regime transitions.
+#
+# These features give weight to the *direction* and *rate-of-change* of
+# price dynamics, not just level. The model can learn that, e.g., a bearish
+# alert into a rising RSI is less reliable than one into a falling RSI.
+# ---------------------------------------------------------------------------
+
+def add_momentum_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Trend and momentum features computed from OHLCV data.
+
+    Features:
+      ema_slope_5d     — EMA10 change over 5 days (short-term trend velocity)
+      ema_slope_20d    — EMA50 change over 20 days (medium-term trend strength)
+      rsi_14           — 14-day RSI (momentum oscillator level)
+      rsi_trend_5d     — RSI[t] - RSI[t-5] (is momentum building or fading?)
+      macd_hist_norm   — (EMA12 - EMA26) / close (signed momentum, normalised)
+      vol_accel        — realvol_5d / realvol_20d (vol acceleration ratio)
+    """
+    close = df["close"]
+
+    # EMA slopes: percentage change of the EMA over the lookback window.
+    # Positive → EMA is rising = trend is up; negative = trend is rolling over.
+    ema10 = _ema(close, span=10)
+    ema50 = _ema(close, span=50)
+    df["ema_slope_5d"]  = ema10 / ema10.shift(5).replace(0, np.nan) - 1
+    df["ema_slope_20d"] = ema50 / ema50.shift(20).replace(0, np.nan) - 1
+
+    # RSI level and its 5-day change.
+    rsi = _rsi(close, window=14)
+    df["rsi_14"]       = rsi
+    df["rsi_trend_5d"] = rsi - rsi.shift(5)
+
+    # MACD histogram normalised by price: (fast EMA − slow EMA) / close.
+    # Positive = bullish momentum; negative = bearish.
+    ema12 = _ema(close, span=12)
+    ema26 = _ema(close, span=26)
+    df["macd_hist_norm"] = (ema12 - ema26) / close.replace(0, np.nan)
+
+    # Volatility acceleration: short-window vol relative to medium-window vol.
+    # Ratio > 1 → vol is expanding (regime shift, spike).
+    # Ratio < 1 → vol is contracting (calm trending or mean-reversion).
+    log_ret = np.log(close / close.shift(1))
+    vol5  = log_ret.rolling(5).std()
+    vol20 = log_ret.rolling(20).std()
+    df["vol_accel"] = vol5 / vol20.replace(0, np.nan)
+
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Block G — inter-stock correlation (peer crowding / herding)
 # ---------------------------------------------------------------------------
 
@@ -358,6 +415,7 @@ def build_features(
         grp = add_volume_features(grp, list(volume_windows))
         grp = add_calendar_features(grp)
         grp = add_intraday_structure_features(grp)
+        grp = add_momentum_features(grp)
 
         if index_close is not None:
             grp = add_regime_features(grp, index_close)

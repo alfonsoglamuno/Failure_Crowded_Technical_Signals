@@ -169,12 +169,33 @@ def _build_feature_matrix(labeled: pd.DataFrame, feat_panel: pd.DataFrame,
     valid = merged[label_col].notna()
     X = merged.loc[valid, feat_cols].fillna(-1)
     y = merged.loc[valid, label_col]
+    dates = pd.to_datetime(merged.loc[valid, "date"])
 
-    return X, y, feat_cols
+    return X, y, feat_cols, dates
+
+
+def _make_sample_weights(dates: pd.Series, halflife_days: int = 252) -> np.ndarray:
+    """
+    Exponential recency weights: recent samples get weight 1.0, older samples decay.
+
+    Half-life = number of calendar days at which weight halves.
+    Default 252 ≈ 1 trading year — data one year old carries ~50% weight.
+
+    Rationale (Jegadeesh & Titman 1993, Lo & MacKinlay 1988):
+      Financial regimes shift over time; stale data can bias the model toward
+      conditions that no longer hold. Exponential weighting is a principled
+      way to keep long history (for rare events) while emphasising recent structure.
+    """
+    ts = pd.to_datetime(dates).values.astype("datetime64[D]").astype(float)
+    age_days = ts.max() - ts        # 0 = most recent
+    decay = np.log(2) / halflife_days
+    weights = np.exp(-decay * age_days)
+    return weights / weights.sum() * len(weights)   # normalise to mean = 1
 
 
 def _train_one_variant(X, y, feat_cols: list, horizon: int, mode: str,
-                       model_dir: Path) -> None:
+                       model_dir: Path, dates: pd.Series | None = None,
+                       halflife_days: int = 252) -> None:
     """Train and save one XGBoost model variant."""
     from xgboost import XGBClassifier
     from sklearn.metrics import roc_auc_score, precision_score
@@ -190,6 +211,14 @@ def _train_one_variant(X, y, feat_cols: list, horizon: int, mode: str,
 
     neg, pos = (y_train == 0).sum(), (y_train == 1).sum()
     spw = neg / pos if pos > 0 else 1.0
+
+    # Recency sample weights — give more influence to recent data
+    sample_weight = None
+    if dates is not None:
+        w = _make_sample_weights(dates, halflife_days=halflife_days)
+        sample_weight = w[:split_idx]
+        log.info("  Sample weights: halflife=%dd  min=%.3f  max=%.3f",
+                 halflife_days, sample_weight.min(), sample_weight.max())
 
     # h1d: lighter model — horizon is very short, fewer trees needed to avoid overfit
     # h5d: deeper trees — more regime context captured at longer horizons
@@ -210,7 +239,12 @@ def _train_one_variant(X, y, feat_cols: list, horizon: int, mode: str,
         n_jobs=-1,
         scale_pos_weight=spw,
     )
-    model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+    model.fit(
+        X_train, y_train,
+        sample_weight=sample_weight,
+        eval_set=[(X_val, y_val)],
+        verbose=False,
+    )
 
     val_proba = model.predict_proba(X_val)[:, 1]
     auc = roc_auc_score(y_val, val_proba)
@@ -350,13 +384,16 @@ def main(paper: bool = True, use_yfinance: bool = False,
     model_dir = Path(cfg["model"]["path"]).parent
     model_dir.mkdir(parents=True, exist_ok=True)
 
+    halflife = cfg["model"].get("sample_weight_halflife_days", 252)
+
     for horizon, mode in variants_to_train:
-        X, y, feat_cols = _build_feature_matrix(labeled, feat_panel, horizon, mode)
+        X, y, feat_cols, dates = _build_feature_matrix(labeled, feat_panel, horizon, mode)
         if X is None:
             log.warning("Skipping variant %s — feature matrix build failed",
                         variant_name(horizon, mode))
             continue
-        _train_one_variant(X, y, feat_cols, horizon, mode, model_dir)
+        _train_one_variant(X, y, feat_cols, horizon, mode, model_dir,
+                           dates=dates, halflife_days=halflife)
 
     # ── Step 6: Report summary ────────────────────────────────────────────────
     log.info("=" * 60)

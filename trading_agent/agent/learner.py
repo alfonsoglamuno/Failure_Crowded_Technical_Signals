@@ -42,11 +42,16 @@ class AdaptiveLearner:
         self.follow_threshold = scfg["follow_threshold"]
         self.follow_disabled  = scfg.get("follow_disabled", True)
 
-        self._min_trades  = mcfg["min_trades_for_recalibration"]
-        self._retrain_days = mcfg["retrain_frequency_days"]
+        self._min_trades       = mcfg["min_trades_for_recalibration"]
+        self._retrain_days     = mcfg["retrain_frequency_days"]
+        self._perf_trigger_pct = mcfg.get("retrain_perf_trigger_pct", 0.10)
+        self._halflife_days    = mcfg.get("sample_weight_halflife_days", 252)
         self._step_up     = mcfg.get("threshold_step_up", 0.02)
         self._step_down   = mcfg.get("threshold_step_down", 0.01)
         self._win_target  = mcfg.get("win_rate_target", 0.55)
+
+        # Baseline hit-rate recorded at last retrain — used for degradation trigger
+        self._baseline_hit_rate: float | None = None
 
         # Per-alert-type win rate tracking
         self._alert_stats: dict[str, dict] = defaultdict(lambda: {"wins": 0, "total": 0})
@@ -185,21 +190,59 @@ class AdaptiveLearner:
     # ── Slow loop: full retrain ───────────────────────────────────────────────
 
     def maybe_retrain(self, universe_data: dict, index_close: pd.Series | None = None):
-        """Retrain model on current universe data if retrain window has passed."""
+        """
+        Retrain model if the scheduled window has passed OR performance has degraded.
+
+        Triggers:
+          1. Time-based  : model file is older than retrain_frequency_days (default 30 = monthly).
+          2. Perf-based  : live hit-rate has dropped more than retrain_perf_trigger_pct (default 10pp)
+                           versus the baseline recorded at the previous retrain.
+                           Rationale: market regime shifts do not follow a calendar. A sudden drop
+                           in hit-rate (e.g. crowding behaviour changes) should trigger an immediate
+                           refresh rather than waiting for the monthly window.
+        """
         model_path = Path(self.cfg["model"]["path"])
-        if model_path.exists():
-            age = (datetime.now() - datetime.fromtimestamp(model_path.stat().st_mtime)).days
-            if age < self._retrain_days:
-                log.info("Model %d days old — retrain in %d days", age, self._retrain_days - age)
-                return
 
         perf = self.journal.get_performance_summary()
-        if perf.get("n_trades", 0) < 10:
-            log.info("Retrain skipped — need ≥10 trades, have %d", perf.get("n_trades", 0))
+        n_trades = perf.get("n_trades", 0)
+        if n_trades < 10:
+            log.info("Retrain skipped — need ≥10 trades, have %d", n_trades)
             return
 
-        log.info("Starting model retrain on live universe data...")
+        time_due = True
+        if model_path.exists():
+            age = (datetime.now() - datetime.fromtimestamp(model_path.stat().st_mtime)).days
+            time_due = age >= self._retrain_days
+            if time_due:
+                log.info("Model %d days old (>= %d) — scheduled monthly retrain",
+                         age, self._retrain_days)
+            else:
+                log.info("Model %d days old — next scheduled retrain in %d days",
+                         age, self._retrain_days - age)
+
+        # Performance degradation check
+        perf_due = False
+        if self._baseline_hit_rate is not None and n_trades >= 20:
+            live_hit_rate = perf.get("hit_rate", 0.0)
+            drop = self._baseline_hit_rate - live_hit_rate
+            if drop >= self._perf_trigger_pct:
+                log.warning(
+                    "Hit-rate dropped %.1fpp (baseline=%.1f%%  current=%.1f%%) "
+                    ">= trigger %.1fpp — early retrain triggered",
+                    drop * 100, self._baseline_hit_rate * 100,
+                    live_hit_rate * 100, self._perf_trigger_pct * 100,
+                )
+                perf_due = True
+
+        if not time_due and not perf_due:
+            return
+
+        log.info("Starting model retrain (time_due=%s  perf_due=%s)...", time_due, perf_due)
         self._retrain(universe_data, index_close)
+
+        # Record new baseline after successful retrain
+        self._baseline_hit_rate = perf.get("hit_rate", 0.0)
+        log.info("Retrain baseline hit-rate set to %.1f%%", self._baseline_hit_rate * 100)
 
     def _retrain(self, universe_data: dict, index_close: pd.Series | None):
         try:
@@ -250,13 +293,32 @@ class AdaptiveLearner:
             neg, pos = (y.iloc[:split] == 0).sum(), (y.iloc[:split] == 1).sum()
             spw = neg / pos if pos > 0 else 1.0
 
+            # Recency sample weights — exponential decay so recent data matters more.
+            # Half-life from config (default 252 days ≈ 1 trading year).
+            sample_weight = None
+            if "date" in labeled.columns:
+                try:
+                    import numpy as _np
+                    dates_all = pd.to_datetime(labeled.loc[valid, "date"])
+                    ts = dates_all.values.astype("datetime64[D]").astype(float)
+                    age_days = ts.max() - ts
+                    decay = _np.log(2) / self._halflife_days
+                    w = _np.exp(-decay * age_days)
+                    w = w / w.sum() * len(w)
+                    sample_weight = w[:split]
+                    log.info("  Retrain sample weights: halflife=%dd  min=%.3f  max=%.3f",
+                             self._halflife_days, sample_weight.min(), sample_weight.max())
+                except Exception as we:
+                    log.debug("Could not compute sample weights: %s", we)
+
             model = XGBClassifier(
                 n_estimators=300, max_depth=4, learning_rate=0.05,
                 subsample=0.8, colsample_bytree=0.8,
                 eval_metric="logloss", random_state=42, n_jobs=-1,
                 scale_pos_weight=spw,
             )
-            model.fit(X.iloc[:split], y.iloc[:split], verbose=False)
+            model.fit(X.iloc[:split], y.iloc[:split],
+                      sample_weight=sample_weight, verbose=False)
 
             val_auc = roc_auc_score(y.iloc[split:], model.predict_proba(X.iloc[split:])[:, 1])
             log.info("Retrained model: val_ROC-AUC=%.4f  n_samples=%d", val_auc, len(y))
