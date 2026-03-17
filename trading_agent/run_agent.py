@@ -55,11 +55,74 @@ _MARKET_CLOSE = dtime(17, 0)
 # GBP-denominated tickers — skip for EUR sizing (exchange rate not applied)
 _GBP_TICKERS = {"CRH.L", "FLTR.L", "NG.L"}
 
+# Maximum fraction of universe tickers allowed to be stale/missing before
+# the agent halts and demands manual review. The EURO STOXX 50 is reconstituted
+# quarterly; a sudden spike in missing tickers is the earliest symptom.
+_MAX_STALE_TICKER_FRACTION = 0.20   # >20% stale → halt
+
 # Horizon-dependent correlation thresholds.
 # Intraday (h1d): positions close EOD — overlap risk is low, gate is soft.
 # Swing/position (h3d, h5d): positions can overlap for days — gate is tighter.
 _PEER_CORR_THRESHOLD = {1: 0.85, 3: 0.70, 5: 0.65}
 _PEER_CORR_WINDOW    = 20     # trading days for correlation lookback
+
+
+def _check_universe_integrity(tickers: list[str], universe_data: dict) -> tuple[list[str], bool]:
+    """
+    Check whether the cached universe data is fresh and complete.
+
+    The EURO STOXX 50 is reconstituted quarterly. When a constituent is replaced,
+    its Yahoo Finance ticker either stops updating or returns no data. This function
+    catches that early so the agent does not trade stale or delisted symbols.
+
+    Returns:
+        stale  : list of tickers with no data or no price update in the last 5 days
+        halt   : True if stale fraction exceeds _MAX_STALE_TICKER_FRACTION
+                 (suggests a major index reconstitution — manual review required)
+    """
+    from datetime import date, timedelta
+    cutoff = date.today() - timedelta(days=7)   # allow for weekends + 1 holiday buffer
+
+    stale = []
+    for ticker in tickers:
+        df = universe_data.get(ticker)
+        if df is None or df.empty:
+            stale.append(ticker)
+            continue
+        try:
+            last_date = df["date"].max() if "date" in df.columns else df.index.max()
+            if hasattr(last_date, "date"):
+                last_date = last_date.date()
+            if last_date < cutoff:
+                stale.append(ticker)
+        except Exception:
+            stale.append(ticker)
+
+    halt = len(stale) / max(len(tickers), 1) > _MAX_STALE_TICKER_FRACTION
+
+    if stale:
+        log.warning(
+            "[UNIVERSE] %d/%d tickers have stale or missing data: %s",
+            len(stale), len(tickers), stale,
+        )
+        if halt:
+            log.error(
+                "[UNIVERSE] %.0f%% of tickers are stale (threshold %.0f%%). "
+                "This may indicate a EURO STOXX 50 reconstitution. "
+                "TRADING HALTED. Update configs/eurostoxx50_tickers.yaml and "
+                "trading_agent/configs/ibkr_contracts.yaml, then retrain the models.",
+                len(stale) / len(tickers) * 100,
+                _MAX_STALE_TICKER_FRACTION * 100,
+            )
+        else:
+            log.warning(
+                "[UNIVERSE] Stale tickers will be skipped this session. "
+                "Verify against https://www.stoxx.com/index-details?isin=EU0009658145",
+            )
+    else:
+        log.info("[UNIVERSE] All %d tickers have recent data.", len(tickers))
+
+    return stale, halt
 
 
 def _corr_threshold(horizon_days: int) -> float:
@@ -411,6 +474,28 @@ def run_once(paper: bool, cfg: dict):
         )
         log.info("Fetched data for %d tickers", len(universe_data))
 
+        # ── Universe integrity check — detect EURO STOXX 50 reconstitution ────
+        stale_tickers, should_halt = _check_universe_integrity(tickers, universe_data)
+        if should_halt:
+            print()
+            print("!" * 68)
+            print("!!  UNIVERSE INTEGRITY CHECK FAILED — TRADING HALTED           !!")
+            print("!!")
+            print(f"!!  {len(stale_tickers)} tickers have stale or missing data (>{_MAX_STALE_TICKER_FRACTION:.0%} threshold).")
+            print("!!  The EURO STOXX 50 may have been reconstituted.")
+            print("!!")
+            print("!!  Action required:")
+            print("!!    1. Verify constituents at stoxx.com")
+            print("!!    2. Update configs/eurostoxx50_tickers.yaml")
+            print("!!    3. Update trading_agent/configs/ibkr_contracts.yaml")
+            print("!!    4. Retrain: python bootstrap_model.py --yfinance")
+            print(f"!!  Stale: {stale_tickers}")
+            print("!" * 68)
+            return
+        # Remove stale tickers from active universe for this session
+        for t in stale_tickers:
+            universe_data.pop(t, None)
+
         # ── Index for regime features ─────────────────────────────────────────
         try:
             import yfinance as yf
@@ -736,8 +821,11 @@ def run_once(paper: bool, cfg: dict):
 
             if result.status in ("submitted", "filled"):
                 n_trades += 1
-                fill_info = (f"fill=%.4f slippage={result.slippage_pct*100:+.3f}%%" % result.actual_fill_price
-                             if result.actual_fill_price > 0 else "fill pending")
+                if result.actual_fill_price > 0:
+                    fill_info = (f"fill={result.actual_fill_price:.4f} "
+                                 f"slippage={result.slippage_pct * 100:+.3f}%")
+                else:
+                    fill_info = "fill pending"
                 log.info("Order placed for %s (orderId=%d  %s)",
                          sig.ticker, result.parent_order_id, fill_info)
             else:
@@ -1141,29 +1229,52 @@ Model variants:
         pos_pct      = cfg["risk"].get("max_position_pct", 0.02) * 100
         capital      = cfg["capital"].get("initial", 0)
         max_loss     = cfg["risk"].get("max_daily_loss_eur", 0)
+        sl_pct       = cfg["risk"].get("stop_loss_pct", 0.015) * 100
+        tp_pct       = cfg["risk"].get("take_profit_pct", 0.025) * 100
         print()
-        print("!" * 64)
-        print("!!                                                            !!")
-        print("!!          *** LIVE TRADING -- REAL MONEY ***                !!")
-        print("!!                                                            !!")
-        print("!" * 64)
-        print(f"  Variant      : {variant}")
-        print(f"  Allow short  : {allow_short}")
-        print(f"  Position size: {pos_pct:.0f}% NAV  (~{capital * pos_pct / 100:,.0f} EUR per trade)")
-        print(f"  Max daily loss: {max_loss:,.0f} EUR  (trading stops if hit)")
-        print(f"  SL / TP      : {cfg['risk'].get('stop_loss_pct',0)*100:.1f}% / "
-              f"{cfg['risk'].get('take_profit_pct',0)*100:.1f}%")
+        print("!" * 68)
+        print("!!                                                                  !!")
+        print("!!              *** LIVE TRADING  --  REAL MONEY ***               !!")
+        print("!!                                                                  !!")
+        print("!" * 68)
         print()
-        print("  Orders will be sent to IBKR and will use REAL FUNDS.")
-        print("  Make sure IB Gateway is on the LIVE (not paper) port.")
+        print("  PERSONAL PROJECT DISCLAIMER")
+        print("  ------------------------------------------------------------------")
+        print("  This software is a personal research project. It is NOT a")
+        print("  registered investment product and is NOT intended for real")
+        print("  trading. Algorithmic trading involves significant financial risk.")
+        print("  You can lose part or all of the capital you deploy.")
         print()
-        confirm = input("  Type 'yes' to confirm live trading, anything else to abort: ")
+        print("  THE AUTHORS ACCEPT NO RESPONSIBILITY WHATSOEVER FOR ANY")
+        print("  FINANCIAL LOSS, MISSED OPPORTUNITY, OR DAMAGE OF ANY KIND")
+        print("  ARISING FROM THE USE OF THIS SOFTWARE.")
+        print()
+        print("  By continuing you acknowledge that you are acting on your own")
+        print("  responsibility and at your own risk.")
+        print("  ------------------------------------------------------------------")
+        print()
+        print("  Trade parameters")
+        print(f"    Variant       : {variant}")
+        print(f"    Allow short   : {allow_short}")
+        print(f"    Position size : {pos_pct:.0f}% NAV  (~{capital * pos_pct / 100:,.0f} EUR per trade)")
+        print(f"    Max daily loss: {max_loss:,.0f} EUR  (trading halts if hit)")
+        print(f"    SL / TP       : {sl_pct:.1f}% / {tp_pct:.1f}%")
+        print()
+        print("  Orders will be sent to IBKR and will CONSUME REAL FUNDS.")
+        print("  Verify IB Gateway is running on the LIVE port (4001).")
+        print()
+        confirm = input("  Type 'yes' to accept all risks and start live trading: ")
         if confirm.strip().lower() != "yes":
             print("Aborted.")
             return
         print()
+        confirm2 = input("  Are you sure? Type 'confirmed' to proceed: ")
+        if confirm2.strip().lower() != "confirmed":
+            print("Aborted.")
+            return
+        print()
         print("  Live trading confirmed. Starting agent...")
-        print("!" * 64)
+        print("!" * 68)
         print()
 
     if args.once:

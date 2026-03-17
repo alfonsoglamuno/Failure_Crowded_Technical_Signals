@@ -8,6 +8,16 @@ Runs live against IBKR, EURO STOXX 50 cash equities only.
 
 ---
 
+## Disclaimer
+
+**This is a personal research project. It is not a registered investment product, not financial advice, and not intended for real trading.**
+
+Algorithmic trading involves significant financial risk. You can lose part or all of the capital you deploy. Past model performance on historical data does not guarantee future results. Market conditions, liquidity, and execution costs can change unpredictably.
+
+**The author accept no responsibility whatsoever for any financial loss, missed opportunity, or damage of any kind arising from the use of this software.** By using or running this agent you acknowledge that you act entirely at your own risk and on your own responsibility.
+
+---
+
 ## How It Works
 
 On each scan cycle (every 30 min during market hours):
