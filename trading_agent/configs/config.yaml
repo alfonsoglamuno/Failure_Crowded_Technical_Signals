@@ -1,0 +1,78 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Trading Agent Configuration
+# Sensitive values (account ID, ports) are in .env — never commit that file.
+# ─────────────────────────────────────────────────────────────────────────────
+
+ibkr:
+  host: 127.0.0.1
+  paper_port: 4002        # IB Gateway paper trading port
+  live_port: 4001         # IB Gateway live trading port
+  client_id: 1
+  account: ""             # Leave blank — auto-detected from .env (IBKR_ACCOUNT=...)
+  timeout: 30
+
+capital:
+  initial: 100000.0       # EUR — IBKR paper demo starts with ~$1M, keep ~100K as working capital
+  currency: EUR
+
+risk:
+  # ── Trial / paper account — large virtual capital, commissions not a constraint ──
+  max_daily_loss_eur: 300.0      # Stop trading today if down 300€ (0.3% of 100K)
+  max_position_pct: 0.02         # 2% of NAV per trade = ~2,000 EUR per position
+  stop_loss_pct: 0.02            # 2% stop-loss
+  take_profit_pct: 0.04          # 4% take-profit  →  risk/reward = 2:1
+  max_trades_per_day: 5          # Up to 5 trades per day (FADE both directions)
+  min_trade_size_eur: 500.0      # Min 500€ — meaningful enough to matter
+  commission_per_trade_eur: 5.0  # ~0.05% × 2000€ × 2 = ~2€ + fees, rounded up
+
+  # Break-even at these params (2,000€ position, 5€ commission):
+  #   TP gross = 2000 × 0.04 = 80€  →  net = 75€
+  #   SL gross = 2000 × 0.02 = 40€  →  net loss = 45€
+  #   Break-even hit rate = 45 / (75 + 45) = 37.5%  (model achieves ~57%)
+
+strategy:
+  fade_threshold: 0.60      # P(failure) >= 0.60 → FADE  (lowered from 0.65 — more signals)
+  follow_threshold: 0.40    # P(failure) <= 0.40 → FOLLOW (raised from 0.35 — symmetric)
+  default_horizon: 3        # days to hold if not stopped out
+  allow_short: true         # SELL signals enabled (paper supports short selling)
+
+  # Start with FADE only — we have more data on it. Enable FOLLOW after 50 FADE trades.
+  follow_disabled: true
+
+  # Crowding gate (Barber & Odean, 2008):
+  #   Only FADE when attention conditions are elevated — vol surge, price extreme,
+  #   or multiple concurrent alerts. Low-crowding signals are skipped even if
+  #   P(failure) is high, because the model may be flagging a regime shift.
+  #   0.30 requires at least one strong indicator (e.g. vol >= 2x avg).
+  crowding_min_score: 0.30
+
+  # Regime-aware threshold boost (Lopez de Prado, 2018):
+  #   When the broad market is trending IN THE SAME DIRECTION as the alert,
+  #   we raise the fade threshold to avoid fading institutional momentum.
+  #   E.g. bullish alert in uptrend → effective threshold = 0.60 + 0.05 = 0.65
+  regime_threshold_boost: 0.05
+
+model:
+  path: "data/model/xgboost_h3d.joblib"
+  feature_cols_path: "data/model/feature_cols.json"
+  min_history_days: 252
+
+  # Learning loop — optimised for active paper trading (5 trades/day → fast feedback)
+  retrain_frequency_days: 14          # Full retrain every 2 weeks
+  min_trades_for_recalibration: 10    # Recalibrate after 10 completed trades
+  threshold_step_up: 0.02             # Tighten threshold when losing
+  threshold_step_down: 0.01           # Loosen when winning
+  win_rate_target: 0.55               # Target hit rate
+
+data:
+  history_days: 504         # ~2 years of daily bars for bootstrap
+  cache_dir: "data/cache"
+  cache_max_age_hours: 20
+
+journal:
+  db_path: "data/journal.db"
+  log_path: "data/agent.log"
+
+universe:
+  parent_tickers_file: "../configs/eurostoxx50_tickers.yaml"
+  ibkr_contracts_file: "configs/ibkr_contracts.yaml"

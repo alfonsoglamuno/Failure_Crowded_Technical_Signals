@@ -1,0 +1,419 @@
+"""
+Trading agent main entry point.
+
+Usage:
+    python run_agent.py --paper          # paper trading (recommended first)
+    python run_agent.py --live           # live trading (use with caution)
+    python run_agent.py --status         # print journal summary, no trading
+    python run_agent.py --paper --once   # run once now, don't schedule
+
+Scheduled automatically at 09:15 CET via cron:
+    15 9 * * 1-5 cd /path/to/trading_agent && .venv/bin/python run_agent.py --paper
+"""
+
+import argparse
+import logging
+import sys
+from datetime import datetime, time as dtime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import yaml
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger("agent")
+
+CET = ZoneInfo("Europe/Berlin")
+
+# Euro STOXX 50 exchanges open 09:00–17:35 CET; we trade 09:10–17:00 window.
+_MARKET_OPEN  = dtime(9, 10)
+_MARKET_CLOSE = dtime(17, 0)
+
+# GBP-denominated tickers — skip for EUR sizing (exchange rate not applied)
+_GBP_TICKERS = {"CRH.L", "FLTR.L", "NG.L"}
+
+
+def is_market_open(now: datetime | None = None) -> bool:
+    """Returns True if we are inside European market hours on a weekday."""
+    t = (now or datetime.now(CET)).astimezone(CET)
+    if t.weekday() >= 5:          # Saturday=5, Sunday=6
+        return False
+    return _MARKET_OPEN <= t.time() <= _MARKET_CLOSE
+
+
+def setup_file_logging(log_path: str):
+    fh = logging.FileHandler(log_path)
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    logging.getLogger().addHandler(fh)
+
+
+def load_config() -> dict:
+    with open("configs/config.yaml") as f:
+        return yaml.safe_load(f)
+
+
+def print_status(journal):
+    print("\n" + "="*50)
+    print("TRADING AGENT STATUS")
+    print("="*50)
+    perf = journal.get_performance_summary()
+    if perf["n_trades"] == 0:
+        print("No completed trades yet.")
+    else:
+        print(f"Completed trades : {perf['n_trades']}")
+        print(f"Total P&L (net)  : {perf['total_pnl']:.2f} EUR")
+        print(f"Avg P&L per trade: {perf['avg_pnl']:.4f} EUR")
+        print(f"Hit rate         : {perf['hit_rate']:.1%}")
+        print(f"Best trade       : {perf['best_trade']:.2f} EUR")
+        print(f"Worst trade      : {perf['worst_trade']:.2f} EUR")
+    print()
+    print("Recent signals:")
+    for s in journal.get_recent_signals(5):
+        print(f"  {s['date']} {s['ticker']:10s} {s['alert_name']:25s} "
+              f"P={s['failure_proba']:.3f} → {s['action']}")
+    print("="*50 + "\n")
+
+
+def run_once(paper: bool, cfg: dict):
+    """Execute one full trading cycle."""
+    from agent.data_feed import IBKRFeed, load_contracts
+    from agent.alerts import detect_universe_alerts
+    from agent.features import build_feature_row
+    from agent.model import FailurePredictor
+    from agent.strategy import make_signals, filter_signals
+    from agent.risk import RiskManager
+    from agent.executor import IBKRExecutor
+    from agent.journal import Journal
+    from agent.learner import AdaptiveLearner
+    from agent.monitor import PositionMonitor
+    from agent.explain import build_explanation
+
+    now = datetime.now(CET)
+    log.info("=== Trading cycle start [%s] === %s", "PAPER" if paper else "LIVE", now.strftime("%Y-%m-%d %H:%M CET"))
+    today = now.date()
+
+    if not is_market_open(now):
+        log.warning("Market is closed right now (%s). Signals will be based on yesterday's close "
+                    "and orders queued until next open. Continuing anyway.", now.strftime("%H:%M CET"))
+
+    # ── Initialise ───────────────────────────────────────────────────────────
+    journal = Journal(cfg["journal"]["db_path"])
+    setup_file_logging(cfg["journal"]["log_path"])
+
+    predictor = FailurePredictor(
+        model_path=cfg["model"]["path"],
+        feature_cols_path=cfg["model"]["feature_cols_path"],
+    )
+    if not predictor.load():
+        log.error("Model not found. Run bootstrap_model.py first.")
+        return
+
+    contracts_cfg = load_contracts(cfg["universe"]["ibkr_contracts_file"])
+    with open(cfg["universe"]["parent_tickers_file"]) as f:
+        tickers = yaml.safe_load(f)["tickers"]
+
+    risk = RiskManager(cfg)
+    learner = AdaptiveLearner(cfg, journal, predictor)
+
+    # ── Connect to IBKR ──────────────────────────────────────────────────────
+    feed = IBKRFeed(cfg, paper=paper)
+    try:
+        feed.connect()
+    except ConnectionError as e:
+        log.error("IBKR connection failed: %s", e)
+        return
+
+    try:
+        # ── Check exits from previous bracket orders ──────────────────────────
+        monitor = PositionMonitor(feed.ib, journal, learner,
+                                  commission=cfg["risk"]["commission_per_trade_eur"])
+        monitor.check_exits()
+
+        nav = feed.get_nav()
+        daily_pnl = feed.get_daily_pnl()
+        log.info("Account NAV: %.2f EUR  Daily P&L: %.2f EUR", nav, daily_pnl)
+
+        # ── Daily loss check ─────────────────────────────────────────────────
+        if not risk.check_daily_loss(daily_pnl):
+            journal.log_daily_summary(nav, daily_pnl, 0, 0, paper, today)
+            return
+
+        # ── Fetch universe data ───────────────────────────────────────────────
+        universe_data = feed.fetch_universe(
+            tickers, contracts_cfg,
+            days=cfg["model"]["min_history_days"] + 50,
+            cache_dir=cfg["data"]["cache_dir"],
+        )
+        log.info("Fetched data for %d tickers", len(universe_data))
+
+        # ── Index for regime features ─────────────────────────────────────────
+        try:
+            import yfinance as yf
+            idx = yf.download("^STOXX50E", period="2y", auto_adjust=True, progress=False)
+            idx.columns = [c[0] if isinstance(c, tuple) else c for c in idx.columns]
+            index_close = idx["Close"]
+            index_close.index = __import__("pandas").to_datetime(index_close.index)
+        except Exception:
+            index_close = None
+
+        # ── Alert detection ───────────────────────────────────────────────────
+        events = detect_universe_alerts(universe_data)
+        log.info("Today's alerts: %d events across %d tickers",
+                 len(events), events["ticker"].nunique() if not events.empty else 0)
+
+        if events.empty:
+            log.info("No alerts today — no trades")
+            journal.log_daily_summary(nav, daily_pnl, 0, 0, paper, today)
+            return
+
+        # ── Feature engineering ───────────────────────────────────────────────
+        feature_df = build_feature_row(
+            events, universe_data,
+            feature_cols=predictor.feature_cols,
+            index_close=index_close,
+        )
+        if feature_df.empty:
+            log.warning("No features built — skipping")
+            return
+
+        # ── Predict ───────────────────────────────────────────────────────────
+        probas = predictor.predict(feature_df)
+        log.info("Predictions: min=%.3f  max=%.3f  mean=%.3f",
+                 probas.min(), probas.max(), probas.mean())
+
+        # ── Strategy + risk filter ────────────────────────────────────────────
+        signals = make_signals(
+            feature_df, probas,
+            fade_threshold=learner.fade_threshold,
+            follow_threshold=learner.follow_threshold,
+            horizon_days=cfg["strategy"]["default_horizon"],
+            crowding_min_score=cfg["strategy"].get("crowding_min_score", 0.30),
+            regime_threshold_boost=cfg["strategy"].get("regime_threshold_boost", 0.05),
+        )
+        signals = filter_signals(
+            signals,
+            max_trades=cfg["risk"]["max_trades_per_day"],
+            allow_short=cfg["strategy"].get("allow_short", False),
+        )
+
+        # ── Log all signals (iterate feature_df rows — aligned with probas) ────
+        # feature_df may have fewer rows than events (skipped tickers)
+        signal_id_map: dict[str, int] = {}  # ticker+alert_name → signal_id
+        for feat_idx in range(len(feature_df)):
+            feat_row  = feature_df.iloc[feat_idx]
+            proba_val = float(probas.iloc[feat_idx])
+            ticker     = feat_row.get("ticker", "")
+            alert_name = feat_row.get("_alert_name_raw", "unknown")
+            direction  = feat_row.get("_dir_raw", "")
+            found_sig  = next(
+                (s for s in signals if s.ticker == ticker and s.alert_name == alert_name),
+                None,
+            )
+            action     = found_sig.action           if found_sig else "SKIP"
+            trade_dir  = found_sig.trade_direction  if found_sig else None
+            conviction = found_sig.conviction       if found_sig else 0.0
+            crowding   = found_sig.crowding_score   if found_sig else 0.0
+
+            # Build explanation only for actionable (non-SKIP) signals
+            explanation = ""
+            if found_sig and action != "SKIP":
+                try:
+                    explanation = build_explanation(
+                        model=predictor._model,
+                        feature_row=feat_row,
+                        feature_cols=predictor.feature_cols,
+                        failure_proba=proba_val,
+                        alert_name=alert_name,
+                        alert_direction=direction,
+                        action=action,
+                        trade_direction=trade_dir or "",
+                        crowding_score=crowding,
+                    )
+                    log.info("[WHY] %s", explanation)
+                except Exception as exc:
+                    log.debug("Explanation build failed for %s: %s", ticker, exc)
+
+            sid = journal.log_signal(
+                ticker=ticker,
+                alert_name=alert_name,
+                alert_direction=direction,
+                failure_proba=proba_val,
+                action=action,
+                trade_direction=trade_dir,
+                conviction=conviction,
+                trade_date=today,
+                crowding_score=crowding,
+                explanation=explanation,
+            )
+            signal_id_map[f"{ticker}|{alert_name}"] = sid
+
+        # Log events that failed feature building as SKIP
+        feature_keys = set(
+            f"{r.get('ticker','')}|{r.get('_alert_name_raw','')}"
+            for _, r in feature_df.iterrows()
+        )
+        for _, ev in events.iterrows():
+            key = f"{ev.get('ticker','')}|{ev.get('alert_name','')}"
+            if key not in feature_keys:
+                journal.log_signal(
+                    ticker=ev.get("ticker", ""),
+                    alert_name=ev.get("alert_name", ""),
+                    alert_direction=ev.get("direction", ""),
+                    failure_proba=0.5,
+                    action="SKIP",
+                    trade_direction=None,
+                    conviction=0.0,
+                    trade_date=today,
+                )
+
+        log.info("Actionable signals: %d", len(signals))
+
+        # ── Execute ───────────────────────────────────────────────────────────
+        executor = IBKRExecutor(feed.ib, contracts_cfg, paper=paper, account=feed.account_id)
+        n_trades = 0
+
+        for sig in signals:
+            # Skip GBP-quoted stocks — position sizing assumes EUR
+            if sig.ticker in _GBP_TICKERS:
+                log.info("Skipping %s (GBP-denominated, EUR sizing not supported)", sig.ticker)
+                continue
+
+            # Qualify the IBKR contract (validates symbol/exchange, gets conId)
+            contract = executor._make_contract(sig.ticker)
+            if contract is None:
+                log.warning("No IBKR contract mapping for %s", sig.ticker)
+                continue
+            if not feed.qualify_contract(contract):
+                log.warning("Contract qualification failed for %s — skipping", sig.ticker)
+                continue
+
+            # Get current price; fall back to last OHLCV close if live quote unavailable
+            ohlcv = universe_data.get(sig.ticker, __import__("pandas").DataFrame())
+            fallback = float(ohlcv["close"].iloc[-1]) if not ohlcv.empty and "close" in ohlcv.columns else 0.0
+            current_price = feed.get_latest_price(contract, fallback_price=fallback)
+
+            if current_price <= 0:
+                log.warning("No price available for %s — skipping", sig.ticker)
+                continue
+
+            sizing = risk.size_position(sig, nav, current_price)
+            if sizing is None:
+                continue
+
+            log.info(
+                "[SIGNAL] %s %s P(failure)=%.3f crowd=%.2f → %s "
+                "qty=%d entry=%.4f SL=%.4f TP=%.4f%s",
+                sig.action, sig.ticker, sig.failure_proba, sig.crowding_score,
+                sig.trade_direction, sizing["quantity"], sizing["entry_price"],
+                sizing["stop_loss"], sizing["take_profit"],
+                " [regime-boost]" if sig.regime_boost_applied else "",
+            )
+
+            result = executor.place_bracket(
+                yahoo_ticker=sig.ticker,
+                trade_direction=sig.trade_direction,
+                quantity=sizing["quantity"],
+                entry_price=sizing["entry_price"],
+                stop_loss=sizing["stop_loss"],
+                take_profit=sizing["take_profit"],
+                action=sig.action,
+                contract=contract,   # pass pre-qualified contract
+            )
+
+            signal_id = signal_id_map.get(f"{sig.ticker}|{sig.alert_name}", -1)
+            journal.log_trade(
+                signal_id=signal_id,
+                ticker=sig.ticker,
+                ibkr_symbol=result.ibkr_symbol,
+                trade_direction=sig.trade_direction,
+                quantity=sizing["quantity"],
+                entry_price=sizing["entry_price"],
+                stop_loss=sizing["stop_loss"],
+                take_profit=sizing["take_profit"],
+                ibkr_order_id=result.parent_order_id,
+                status=result.status,
+                paper=paper,
+                trade_date=today,
+            )
+
+            if result.status == "submitted":
+                n_trades += 1
+                log.info("Order submitted for %s (orderId=%d)", sig.ticker, result.parent_order_id)
+            else:
+                log.error("Order FAILED for %s: %s", sig.ticker, result.error_msg)
+
+        # ── Daily summary ─────────────────────────────────────────────────────
+        journal.log_daily_summary(nav, daily_pnl, len(events), n_trades, paper, today)
+        log.info("=== Cycle complete: %d signals, %d trades placed ===",
+                 len(events), n_trades)
+
+        # ── Learning loops ────────────────────────────────────────────────────
+        learner.maybe_recalibrate()
+        learner.maybe_retrain(universe_data, index_close)
+
+    finally:
+        feed.disconnect()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Crowded Signal Failure Trading Agent")
+    parser.add_argument("--paper", action="store_true", default=True,
+                        help="Paper trading mode (default)")
+    parser.add_argument("--live", action="store_true",
+                        help="Live trading mode (real money)")
+    parser.add_argument("--once", action="store_true",
+                        help="Run once immediately, do not schedule")
+    parser.add_argument("--status", action="store_true",
+                        help="Print journal status and exit")
+    args = parser.parse_args()
+
+    if args.live and args.paper:
+        args.paper = False   # --live takes precedence
+
+    cfg = load_config()
+
+    if args.status:
+        from agent.journal import Journal
+        journal = Journal(cfg["journal"]["db_path"])
+        print_status(journal)
+        return
+
+    if args.live:
+        log.warning("⚠  LIVE TRADING MODE — real money will be used")
+        confirm = input("Type 'yes' to confirm: ")
+        if confirm.strip().lower() != "yes":
+            print("Aborted.")
+            return
+
+    if args.once:
+        run_once(paper=not args.live, cfg=cfg)
+        return
+
+    # Scheduled mode: run at 09:15 CET every weekday
+    import schedule
+    import time
+
+    def job():
+        now = datetime.now(CET)
+        if now.weekday() >= 5:   # skip weekends
+            return
+        run_once(paper=not args.live, cfg=cfg)
+
+    schedule.every().day.at("09:15").do(job)
+    log.info("Scheduler started. Waiting for 09:15 CET... (Ctrl+C to stop)")
+    while True:
+        schedule.run_pending()
+        time.sleep(30)
+
+
+if __name__ == "__main__":
+    main()

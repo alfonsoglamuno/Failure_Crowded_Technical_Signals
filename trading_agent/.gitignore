@@ -1,0 +1,17 @@
+# Never commit trading data or credentials
+data/cache/
+data/journal.db
+data/model/
+data/agent.log
+data/cron.log
+*.db
+*.log
+
+# Never commit credentials or live config
+.env
+configs/live_config.yaml
+
+# Python
+__pycache__/
+*.pyc
+.venv/

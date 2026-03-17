@@ -1,0 +1,55 @@
+# IBKR contract specifications for EURO STOXX 50 universe.
+# Yahoo ticker → IBKR (symbol, exchange, currency)
+# Exchange codes: XETRA (DE), AEB (NL), SBF (FR), BVME (IT), BM (ES),
+#                 EBR (BE), HEX (FI), LSE (GB)
+
+contracts:
+  "ABI.BR":    {symbol: "ABI",    exchange: "EBR",   currency: "EUR"}
+  "ADYEN.AS":  {symbol: "ADYEN",  exchange: "AEB",   currency: "EUR"}
+  "AD.AS":     {symbol: "AD",     exchange: "AEB",   currency: "EUR"}
+  "AIR.PA":    {symbol: "AIR",    exchange: "SBF",   currency: "EUR"}
+  "ALV.DE":    {symbol: "ALV",    exchange: "XETRA", currency: "EUR"}
+  "AI.PA":     {symbol: "AI",     exchange: "SBF",   currency: "EUR"}
+  "ASML.AS":   {symbol: "ASML",   exchange: "AEB",   currency: "EUR"}
+  "CS.PA":     {symbol: "CS",     exchange: "SBF",   currency: "EUR"}
+  "BAS.DE":    {symbol: "BAS",    exchange: "XETRA", currency: "EUR"}
+  "BAYN.DE":   {symbol: "BAYN",   exchange: "XETRA", currency: "EUR"}
+  "BMW.DE":    {symbol: "BMW",    exchange: "XETRA", currency: "EUR"}
+  "BNP.PA":    {symbol: "BNP",    exchange: "SBF",   currency: "EUR"}
+  "CRH.L":     {symbol: "CRH",    exchange: "LSE",   currency: "GBP"}
+  "DB1.DE":    {symbol: "DB1",    exchange: "XETRA", currency: "EUR"}
+  "DHL.DE":    {symbol: "DHL",    exchange: "XETRA", currency: "EUR"}
+  "DTE.DE":    {symbol: "DTE",    exchange: "XETRA", currency: "EUR"}
+  "ENEL.MI":   {symbol: "ENEL",   exchange: "BVME",  currency: "EUR"}
+  "ENI.MI":    {symbol: "ENI",    exchange: "BVME",  currency: "EUR"}
+  "EL.PA":     {symbol: "EL",     exchange: "SBF",   currency: "EUR"}
+  "FLTR.L":    {symbol: "FLTR",   exchange: "LSE",   currency: "GBP"}
+  "FME.DE":    {symbol: "FME",    exchange: "XETRA", currency: "EUR"}
+  "HEI.DE":    {symbol: "HEI",    exchange: "XETRA", currency: "EUR"}
+  "HEN3.DE":   {symbol: "HEN3",   exchange: "XETRA", currency: "EUR"}
+  "IBE.MC":    {symbol: "IBE",    exchange: "BM",    currency: "EUR"}
+  "IFX.DE":    {symbol: "IFX",    exchange: "XETRA", currency: "EUR"}
+  "INGA.AS":   {symbol: "INGA",   exchange: "AEB",   currency: "EUR"}
+  "ISP.MI":    {symbol: "ISP",    exchange: "BVME",  currency: "EUR"}
+  "KER.PA":    {symbol: "KER",    exchange: "SBF",   currency: "EUR"}
+  "LIN.DE":    {symbol: "LIN",    exchange: "XETRA", currency: "EUR"}
+  "MC.PA":     {symbol: "MC",     exchange: "SBF",   currency: "EUR"}
+  "MBG.DE":    {symbol: "MBG",    exchange: "XETRA", currency: "EUR"}
+  "MRK.DE":    {symbol: "MRK",    exchange: "XETRA", currency: "EUR"}
+  "MUV2.DE":   {symbol: "MUV2",   exchange: "XETRA", currency: "EUR"}
+  "NG.L":      {symbol: "NG",     exchange: "LSE",   currency: "GBP"}
+  "NOKIA.HE":  {symbol: "NOKIA",  exchange: "HEX",   currency: "EUR"}
+  "OR.PA":     {symbol: "OR",     exchange: "SBF",   currency: "EUR"}
+  "PHIA.AS":   {symbol: "PHIA",   exchange: "AEB",   currency: "EUR"}
+  "PRX.AS":    {symbol: "PRX",    exchange: "AEB",   currency: "EUR"}
+  "RMS.PA":    {symbol: "RMS",    exchange: "SBF",   currency: "EUR"}
+  "RWE.DE":    {symbol: "RWE",    exchange: "XETRA", currency: "EUR"}
+  "SAF.PA":    {symbol: "SAF",    exchange: "SBF",   currency: "EUR"}
+  "SAN.MC":    {symbol: "SAN",    exchange: "BM",    currency: "EUR"}
+  "SAP.DE":    {symbol: "SAP",    exchange: "XETRA", currency: "EUR"}
+  "SIE.DE":    {symbol: "SIE",    exchange: "XETRA", currency: "EUR"}
+  "STLAM.MI":  {symbol: "STLAM",  exchange: "BVME",  currency: "EUR"}
+  "TTE.PA":    {symbol: "TTE",    exchange: "SBF",   currency: "EUR"}
+  "UCG.MI":    {symbol: "UCG",    exchange: "BVME",  currency: "EUR"}
+  "VIV.PA":    {symbol: "VIV",    exchange: "SBF",   currency: "EUR"}
+  "VOW3.DE":   {symbol: "VOW3",   exchange: "XETRA", currency: "EUR"}
