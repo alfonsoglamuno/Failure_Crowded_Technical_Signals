@@ -39,8 +39,8 @@ class Signal:
     action: str              # FADE / FOLLOW
     failure_proba: float
     horizon_days: int
-    conviction: float        # 0–1, distance from effective decision boundary
-    crowding_score: float    # 0–1, Barber & Odean attention intensity
+    conviction: float        # 0-1, distance from effective decision boundary
+    crowding_score: float    # 0-1, Barber & Odean attention intensity
     regime_boost_applied: bool = False  # True when threshold was raised for regime
 
 
@@ -149,14 +149,15 @@ def _infer_alert(row: pd.Series) -> str:
 
 def filter_signals(
     signals: list[Signal],
-    max_trades: int = 5,
+    max_trades: int = 50,
     allow_short: bool = True,
 ) -> list[Signal]:
     """
     Apply pre-trade filters:
-    - Limit to max_trades per day (sorted by conviction, highest first)
     - Optionally block SELL signals (long-only mode)
     - No duplicate tickers
+    - No hard top-N cap — position limits are enforced via max_open_positions
+      and capital constraints instead.
     """
     seen_tickers = set()
     filtered     = []
@@ -169,7 +170,5 @@ def filter_signals(
             continue
         seen_tickers.add(sig.ticker)
         filtered.append(sig)
-        if len(filtered) >= max_trades:
-            break
 
     return filtered

@@ -60,10 +60,10 @@ def compute_crowding_score(row: pd.Series) -> float:
     Returns a crowding / attention score in [0, 1].
 
     Components (Barber & Odean, 2008):
-      • Volume anomaly  — retail attention proxy (0–0.40)
-      • Simultaneous alerts — multiple crowd signals (0–0.30)
-      • Price at 52w extreme — price attention zone (0–0.20)
-      • Compressed volatility — ATR exhaustion → reversal likely (0–0.10)
+      • Volume anomaly  — retail attention proxy (0-0.40)
+      • Simultaneous alerts — multiple crowd signals (0-0.30)
+      • Price at 52w extreme — price attention zone (0-0.20)
+      • Compressed volatility — ATR exhaustion → reversal likely (0-0.10)
 
     A score ≥ 0.30 means at least one strong attention indicator is present.
     """

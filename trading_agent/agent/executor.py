@@ -75,19 +75,42 @@ class IBKRExecutor:
                 error_msg=f"No IBKR contract mapping for {yahoo_ticker}",
             )
 
+        # Use SMART routing for order placement — avoids exchange-direct restrictions
+        # (IB Gateway Precautionary Settings error 10311) and resolves conId-based
+        # contracts regardless of which exchange they qualified on.
+        # IBKR's SMART router uses conId to identify the exact contract and routes
+        # to the best-priced exchange automatically.
+        if getattr(contract, "conId", 0) and contract.exchange != "SMART":
+            order_contract = Stock(contract.symbol, "SMART", contract.currency)
+            order_contract.conId = contract.conId
+        else:
+            order_contract = contract
+
         ib_action = trade_direction        # "BUY" or "SELL"
         ib_exit_action = "SELL" if ib_action == "BUY" else "BUY"
         qty = int(round(quantity))         # whole shares only — required by European exchanges
+
+        def _tick_round(price: float) -> float:
+            """Round to nearest valid tick size for European equities.
+
+            IBKR uses MTA tick tables; for stocks >= 1 EUR the common sizes are:
+              price < 1   → 0.0001   price 1-10  → 0.001
+              price 10-50 → 0.005    price >= 50 → 0.01
+            Using 0.01 as the safe default covers most Euro STOXX 50 names.
+            """
+            tick = 0.01
+            return round(round(price / tick) * tick, 4)
 
         try:
             # ── Step 1: market entry (transmit=False — hold until children are set) ──
             parent = MarketOrder(ib_action, qty)
             parent.transmit = False
             parent.outsideRth = False      # RTH only — no pre/post market fills
+            parent.tif = "DAY"             # explicit TIF prevents order-preset override (error 10349)
             if self.account:
                 parent.account = self.account
 
-            parent_trade = self.ib.placeOrder(contract, parent)
+            parent_trade = self.ib.placeOrder(order_contract, parent)
             self.ib.sleep(0.5)             # wait for TWS to assign a valid orderId
 
             parent_id = parent.orderId
@@ -95,23 +118,25 @@ class IBKRExecutor:
                 raise RuntimeError(f"TWS did not assign an orderId for {yahoo_ticker} parent order")
 
             # ── Step 2: take-profit limit order ──────────────────────────────────────
-            tp = LimitOrder(ib_exit_action, qty, round(take_profit, 4))
+            tp = LimitOrder(ib_exit_action, qty, _tick_round(take_profit))
             tp.parentId = parent_id
             tp.transmit = False
             tp.outsideRth = False
+            tp.tif = "GTC"                 # stay open until hit or manually cancelled
             if self.account:
                 tp.account = self.account
 
             # ── Step 3: stop-loss order — transmit=True releases the whole bracket ──
-            sl = StopOrder(ib_exit_action, qty, round(stop_loss, 4))
+            sl = StopOrder(ib_exit_action, qty, _tick_round(stop_loss))
             sl.parentId = parent_id
             sl.transmit = True
             sl.outsideRth = False
+            sl.tif = "GTC"                 # stay open until hit or manually cancelled
             if self.account:
                 sl.account = self.account
 
-            self.ib.placeOrder(contract, tp)
-            self.ib.placeOrder(contract, sl)
+            self.ib.placeOrder(order_contract, tp)
+            self.ib.placeOrder(order_contract, sl)
             self.ib.sleep(1)               # allow TWS to confirm all three
 
             # Verify the parent order was accepted

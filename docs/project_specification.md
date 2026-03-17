@@ -136,7 +136,7 @@ For an alert on day `t` with horizon `h` and threshold `θ = 0.005` (0.5%):
 
 ### Base Rate (empirical)
 
-From smoke test on 3 tickers (2018–2024), h=3: ~46% failure rate. Expect similar across full universe — roughly balanced, which is healthy for classification.
+From smoke test on 3 tickers (2018-2024), h=3: ~46% failure rate. Expect similar across full universe — roughly balanced, which is healthy for classification.
 
 ---
 
@@ -195,8 +195,8 @@ From smoke test on 3 tickers (2018–2024), h=3: ~46% failure rate. Expect simil
 ### Block F — Calendar Features
 | Feature          | Description          |
 |------------------|----------------------|
-| `dow`            | Day of week (0–4)    |
-| `month`          | Month (1–12)         |
+| `dow`            | Day of week (0-4)    |
+| `month`          | Month (1-12)         |
 | `is_month_end`   | Binary               |
 | `is_month_start` | Binary               |
 
@@ -296,10 +296,10 @@ strategy_metrics(ml_filtered_returns, cost_bps=10)
 
 | Parameter         | Default | Range to explore       |
 |-------------------|---------|------------------------|
-| `theta`           | 0.005   | 0.002 – 0.015          |
+| `theta`           | 0.005   | 0.002 - 0.015          |
 | `horizon`         | 3       | 1, 3, 5                |
-| `confidence_threshold` | 0.60 | 0.55 – 0.75         |
-| `purge_days`      | 5       | 3 – 10                 |
-| `embargo_days`    | 10      | 5 – 20                 |
-| `xgb max_depth`   | 4       | 3 – 6                  |
-| `vol_spike_z_threshold` | 2.0 | 1.5 – 3.0           |
+| `confidence_threshold` | 0.60 | 0.55 - 0.75         |
+| `purge_days`      | 5       | 3 - 10                 |
+| `embargo_days`    | 10      | 5 - 20                 |
+| `xgb max_depth`   | 4       | 3 - 6                  |
+| `vol_spike_z_threshold` | 2.0 | 1.5 - 3.0           |

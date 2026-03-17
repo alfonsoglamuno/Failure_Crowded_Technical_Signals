@@ -126,9 +126,20 @@ def run_checks(paper: bool) -> bool:
             if qualified:
                 price = feed.get_latest_price(contract)
                 price_ok = price > 0
-                check(f"Market data / price quote", price_ok,
-                      f"{price:.2f} {spec['currency']}" if price_ok else "no quote — check data subscription")
-                if not price_ok:
+                # Check if OHLCV cache exists as fallback
+                cache_dir = Path(cfg["data"]["cache_dir"])
+                cache_file = cache_dir / f"{test_ticker.replace('/', '_')}.parquet"
+                has_cache = cache_file.exists()
+                if price_ok:
+                    check(f"Market data / price quote", True,
+                          f"{price:.2f} {spec['currency']}")
+                elif has_cache:
+                    check(f"Market data / price quote", True,
+                          f"no live quote — will use OHLCV cache fallback (ok for paper)",
+                          warn=True)
+                else:
+                    check(f"Market data / price quote", False,
+                          "no quote and no cache — run bootstrap_model.py --yfinance first")
                     all_ok = False
 
         feed.disconnect()

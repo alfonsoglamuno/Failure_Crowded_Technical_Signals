@@ -4,7 +4,7 @@
 
 A machine learning framework to predict the short-term **failure** of popular technical alerts in the **EURO STOXX 50** universe. Rather than treating indicators as direct trade signals, this project models them as observable events whose reliability depends on surrounding market conditions.
 
-**Core question:** Given a visible chart alert (breakout, RSI extreme, MACD cross, abnormal volume), and the current market context — what is the probability that this alert will *fade* rather than follow through over the next 1–5 sessions?
+**Core question:** Given a visible chart alert (breakout, RSI extreme, MACD cross, abnormal volume), and the current market context — what is the probability that this alert will *fade* rather than follow through over the next 1-5 sessions?
 
 ---
 

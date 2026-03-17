@@ -5,15 +5,17 @@ Usage:
     python run_agent.py --paper          # paper trading (recommended first)
     python run_agent.py --live           # live trading (use with caution)
     python run_agent.py --status         # print journal summary, no trading
-    python run_agent.py --paper --once   # run once now, don't schedule
+    python run_agent.py --paper --once   # run once now, don't loop
 
-Scheduled automatically at 09:15 CET via cron:
-    15 9 * * 1-5 cd /path/to/trading_agent && .venv/bin/python run_agent.py --paper
+Continuous intraday mode (default):
+    Scans every scan_interval_min minutes during market hours, closes all
+    positions at eod_close_time CET.  Press Ctrl+C to stop.
 """
 
 import argparse
 import logging
 import sys
+import time
 from datetime import datetime, time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -34,7 +36,7 @@ log = logging.getLogger("agent")
 
 CET = ZoneInfo("Europe/Berlin")
 
-# Euro STOXX 50 exchanges open 09:00–17:35 CET; we trade 09:10–17:00 window.
+# Euro STOXX 50 exchanges open 09:00-17:35 CET; we trade 09:10-17:00 window.
 _MARKET_OPEN  = dtime(9, 10)
 _MARKET_CLOSE = dtime(17, 0)
 
@@ -281,11 +283,62 @@ def run_once(paper: bool, cfg: dict):
         executor = IBKRExecutor(feed.ib, contracts_cfg, paper=paper, account=feed.account_id)
         n_trades = 0
 
+        # Dedup: don't re-trade a ticker that already has an open order today.
+        # Handles the case where the agent runs multiple times per day.
+        already_traded_today = {
+            t["ticker"] for t in journal.get_recent_trades(100)
+            if str(t.get("trade_date", "")) == str(today)
+               and t.get("status") in ("submitted", "open", "pending")
+        }
+        if already_traded_today:
+            log.info("Already traded today: %s — will not re-enter", sorted(already_traded_today))
+
+        # Build set of tickers currently held long in IBKR (don't double-enter)
+        open_ibkr_positions: set[str] = set()
+        try:
+            # reverse-map IBKR symbol -> yahoo ticker
+            symbol_to_yahoo = {v["symbol"]: k for k, v in contracts_cfg.items()}
+            for pos in feed.ib.positions():
+                if pos.position > 0:
+                    yahoo = symbol_to_yahoo.get(pos.contract.symbol, "")
+                    if yahoo:
+                        open_ibkr_positions.add(yahoo)
+            if open_ibkr_positions:
+                log.info("Currently holding long positions: %s", sorted(open_ibkr_positions))
+        except Exception:
+            pass
+
+        max_open = cfg["strategy"].get("max_open_positions", 10)
+        slots_available = max_open - len(open_ibkr_positions)
+        if slots_available <= 0:
+            log.info("Position cap reached (%d/%d) — no new trades this scan",
+                     len(open_ibkr_positions), max_open)
+            journal.log_daily_summary(nav, daily_pnl, len(events), 0, paper, today)
+            return
+
+        log.info("Open positions: %d/%d — %d slot(s) available",
+                 len(open_ibkr_positions), max_open, slots_available)
+
         for sig in signals:
             # Skip GBP-quoted stocks — position sizing assumes EUR
             if sig.ticker in _GBP_TICKERS:
                 log.info("Skipping %s (GBP-denominated, EUR sizing not supported)", sig.ticker)
                 continue
+
+            # Dedup — skip tickers already traded in an earlier scan today
+            if sig.ticker in already_traded_today:
+                log.info("Skipping %s — already have an open trade from today's earlier scan", sig.ticker)
+                continue
+
+            # Don't add to an existing long position
+            if sig.ticker in open_ibkr_positions:
+                log.info("Skipping %s — already holding long position", sig.ticker)
+                continue
+
+            # Stop adding once we've filled all available slots this scan
+            if n_trades >= slots_available:
+                log.info("Slot cap reached for this scan (%d new trades) — stopping", n_trades)
+                break
 
             # Qualify the IBKR contract (validates symbol/exchange, gets conId)
             contract = executor._make_contract(sig.ticker)
@@ -310,7 +363,7 @@ def run_once(paper: bool, cfg: dict):
                 continue
 
             log.info(
-                "[SIGNAL] %s %s P(failure)=%.3f crowd=%.2f → %s "
+                "[SIGNAL] %s %s P(failure)=%.3f crowd=%.2f -> %s "
                 "qty=%d entry=%.4f SL=%.4f TP=%.4f%s",
                 sig.action, sig.ticker, sig.failure_proba, sig.crowding_score,
                 sig.trade_direction, sizing["quantity"], sizing["entry_price"],
@@ -364,6 +417,50 @@ def run_once(paper: bool, cfg: dict):
         feed.disconnect()
 
 
+def _eod_close(paper: bool, cfg: dict):
+    """Cancel all bracket orders and close open long positions with market orders."""
+    from agent.data_feed import IBKRFeed, load_contracts
+    from ib_insync import MarketOrder
+    import os
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    feed = IBKRFeed(cfg, paper=paper)
+    try:
+        feed.connect()
+        ib = feed.ib
+        account = feed.account_id
+
+        # Cancel all open orders (TP/SL brackets)
+        open_orders = ib.reqAllOpenOrders()
+        ib.sleep(1)
+        for t in open_orders:
+            try:
+                ib.cancelOrder(t.order)
+            except Exception:
+                pass
+        ib.sleep(2)
+        log.info("Cancelled %d open bracket orders", len(open_orders))
+
+        # Close all long positions with market orders
+        positions = ib.positions()
+        closed = 0
+        for pos in positions:
+            if pos.position > 0:
+                order = MarketOrder("SELL", int(pos.position))
+                order.account = account
+                order.tif = "DAY"
+                ib.placeOrder(pos.contract, order)
+                log.info("EOD close: SELL %d %s", int(pos.position), pos.contract.symbol)
+                closed += 1
+        ib.sleep(3)
+        log.info("EOD close complete — %d positions closed", closed)
+    except Exception as e:
+        log.error("EOD close failed: %s", e)
+    finally:
+        feed.disconnect()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Crowded Signal Failure Trading Agent")
     parser.add_argument("--paper", action="store_true", default=True,
@@ -374,6 +471,8 @@ def main():
                         help="Run once immediately, do not schedule")
     parser.add_argument("--status", action="store_true",
                         help="Print journal status and exit")
+    parser.add_argument("--eod-close", action="store_true",
+                        help="Cancel all brackets and close all longs now (EOD safety net)")
     args = parser.parse_args()
 
     if args.live and args.paper:
@@ -387,6 +486,10 @@ def main():
         print_status(journal)
         return
 
+    if args.eod_close:
+        _eod_close(paper=not args.live, cfg=cfg)
+        return
+
     if args.live:
         log.warning("⚠  LIVE TRADING MODE — real money will be used")
         confirm = input("Type 'yes' to confirm: ")
@@ -398,21 +501,33 @@ def main():
         run_once(paper=not args.live, cfg=cfg)
         return
 
-    # Scheduled mode: run at 09:15 CET every weekday
-    import schedule
-    import time
+    # Continuous intraday monitoring loop
+    scan_interval = cfg["strategy"].get("scan_interval_min", 30) * 60
+    eod_str = cfg["strategy"].get("eod_close_time", "16:30")
+    eod_h, eod_m = int(eod_str.split(":")[0]), int(eod_str.split(":")[1])
 
-    def job():
-        now = datetime.now(CET)
-        if now.weekday() >= 5:   # skip weekends
-            return
-        run_once(paper=not args.live, cfg=cfg)
+    log.info(
+        "Intraday monitor started — scanning every %d min, EOD close at %s CET (Ctrl+C to stop)",
+        cfg["strategy"].get("scan_interval_min", 30), eod_str,
+    )
 
-    schedule.every().day.at("09:15").do(job)
-    log.info("Scheduler started. Waiting for 09:15 CET... (Ctrl+C to stop)")
     while True:
-        schedule.run_pending()
-        time.sleep(30)
+        now = datetime.now(CET)
+
+        # EOD close — runs once when we cross the EOD time
+        if now.weekday() < 5 and now.hour == eod_h and now.minute >= eod_m and now.minute < eod_m + 5:
+            log.info("EOD close time reached (%s CET) — closing all open positions", eod_str)
+            _eod_close(paper=not args.live, cfg=cfg)
+            # Sleep past the 5-minute window so we don't run it again
+            time.sleep(300)
+            continue
+
+        if is_market_open(now):
+            run_once(paper=not args.live, cfg=cfg)
+        else:
+            log.info("Market closed at %s — waiting...", now.strftime("%H:%M CET"))
+
+        time.sleep(scan_interval)
 
 
 if __name__ == "__main__":

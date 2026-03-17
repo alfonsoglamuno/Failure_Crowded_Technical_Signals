@@ -32,9 +32,9 @@ IBKR data ──► Alert Detection ──► Feature Engineering ──► XGBo
 
 | Decile | P(failure) | Actual Fail % | Action |
 |--------|-----------|---------------|--------|
-| Top 10% | 0.75–0.99 | **82.0%** | FADE |
-| Top 20% | 0.63–0.75 | 62.7% | FADE |
-| Bottom 10% | 0.04–0.26 | 18.6% | FOLLOW |
+| Top 10% | 0.75-0.99 | **82.0%** | FADE |
+| Top 20% | 0.63-0.75 | 62.7% | FADE |
+| Bottom 10% | 0.04-0.26 | 18.6% | FOLLOW |
 
 > Break-even needed with 2,000 EUR position: **37.5%**. Model delivers **69.6%** on FADE signals.
 
@@ -214,7 +214,7 @@ trading_agent/
 | P(failure) | Action | Trade direction |
 |-----------|--------|----------------|
 | ≥ 0.60 | **FADE** | Opposite of alert (fade the crowd) |
-| 0.40–0.60 | **SKIP** | No trade — model uncertain |
+| 0.40-0.60 | **SKIP** | No trade — model uncertain |
 | ≤ 0.40 | **FOLLOW** | Same as alert (disabled by default) |
 
 **FADE examples:**
@@ -259,7 +259,7 @@ tail -f data/agent.log  # Linux/Mac
 
 ## Go Live
 
-After 2–4 weeks of paper trading with satisfactory results:
+After 2-4 weeks of paper trading with satisfactory results:
 
 1. Switch IB Gateway to **Live** account
 2. Verify funds and permissions for **European stock trading** (no options permissions needed)

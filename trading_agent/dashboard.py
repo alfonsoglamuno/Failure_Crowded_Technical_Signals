@@ -26,13 +26,13 @@ import os
 import yaml
 from dotenv import load_dotenv
 
-# ── path setup ────────────────────────────────────────────────────────────────
+# -- path setup ----------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 load_dotenv()   # read IBKR_ACCOUNT from .env if present
 
 _W = 72   # terminal width
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# -- helpers -------------------------------------------------------------------
 
 def _load_cfg() -> dict:
     with open("configs/config.yaml") as f:
@@ -68,7 +68,7 @@ def _header(title: str) -> str:
     return _sep("=") + "\n" + " " * pad + title + "\n" + _sep("=")
 
 
-# ── sections ──────────────────────────────────────────────────────────────────
+# -- sections ------------------------------------------------------------------
 
 def section_summary(conn: sqlite3.Connection, cfg: dict) -> str:
     row = conn.execute("""
@@ -299,7 +299,7 @@ def section_todays_signals(conn: sqlite3.Connection) -> str:
                 # Word-wrap to terminal width
                 max_len = _W - 6
                 wrapped = expl if len(expl) <= max_len else expl[:max_len - 3] + "..."
-                lines.append(f"    ↳ {wrapped}")
+                lines.append(f"    -> {wrapped}")
     return "\n".join(lines)
 
 
@@ -327,22 +327,22 @@ def section_trade_rationale(conn: sqlite3.Connection, n: int = 10) -> str:
             lines.append(
                 f"  {r['date']}  {(r['ticker'] or ''):10}  "
                 f"{(r['action'] or 'FADE'):5} {(r['trade_direction'] or ''):4}  "
-                f"entry={r['entry_price']:.3f} → exit={r['exit_price']:.3f}{outcome}"
+                f"entry={r['entry_price']:.3f} -> exit={r['exit_price']:.3f}{outcome}"
             )
             expl = (r["explanation"] or "").strip()
             if expl:
                 max_len = _W - 6
                 wrapped = expl if len(expl) <= max_len else expl[:max_len - 3] + "..."
-                lines.append(f"    ↳ {wrapped}")
+                lines.append(f"    -> {wrapped}")
             else:
                 lines.append(
-                    f"    ↳ P(fail)={r['failure_proba']:.2f}  "
+                    f"    -> P(fail)={r['failure_proba']:.2f}  "
                     f"crowd={r['crowding_score']:.2f}  (no explanation stored)"
                 )
     return "\n".join(lines)
 
 
-# ── main ──────────────────────────────────────────────────────────────────────
+# -- main ----------------------------------------------------------------------
 
 def render(cfg: dict, show_trades: bool = False, show_signals: bool = False) -> str:
     db_path = cfg["journal"]["db_path"]

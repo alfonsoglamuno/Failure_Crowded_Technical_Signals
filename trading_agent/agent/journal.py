@@ -95,9 +95,27 @@ class Journal:
         crowding_score: float = 0.0,
         explanation: str = "",
     ) -> int:
+        """Insert or update a signal for today. Upserts on (date, ticker, alert_name)
+        so re-running the agent in the same day doesn't create duplicate log entries."""
         ts = datetime.utcnow().isoformat()
         d = str(trade_date or date.today())
         with self._conn() as conn:
+            # Check if this signal already exists for today
+            existing = conn.execute(
+                "SELECT id FROM signals WHERE date=? AND ticker=? AND alert_name=?",
+                (d, ticker, alert_name),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """UPDATE signals SET ts=?, failure_proba=?, action=?,
+                       trade_direction=?, conviction=?, crowding_score=?,
+                       explanation=?
+                       WHERE id=?""",
+                    (ts, float(failure_proba), action, trade_direction,
+                     float(conviction), float(crowding_score), explanation,
+                     existing[0]),
+                )
+                return existing[0]
             cur = conn.execute(
                 """INSERT INTO signals
                    (ts, date, ticker, alert_name, alert_direction,

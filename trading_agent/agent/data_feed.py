@@ -52,8 +52,8 @@ class IBKRFeed:
             log.info("Connected. Account: %s", self.account_id)
             # Use frozen/delayed data — works on paper accounts without live subscriptions.
             # Type 1=live, 2=frozen(last price), 3=delayed(15min), 4=delayed+frozen
-            # Type 4 is safest: gives last known price even outside market hours.
-            market_data_type = 2 if self.paper else 1
+            # Type 4 is most permissive: returns delayed data and falls back to frozen.
+            market_data_type = 4 if self.paper else 1
             self.ib.reqMarketDataType(market_data_type)
             log.info("Market data type set to %d (%s)",
                      market_data_type, "frozen/paper" if self.paper else "live")
@@ -79,18 +79,45 @@ class IBKRFeed:
         return accounts[0] if accounts else ""
 
     def get_account_summary(self) -> dict:
-        summary = self.ib.accountSummary(self.account_id)
+        # Request all account values (no account filter) — paper accounts use an
+        # internal ID (e.g. DUP451913) that differs from the external account number
+        # (U24843486), so filtering by account_id may return nothing.
+        all_items = self.ib.accountSummary()
         result = {}
-        for item in summary:
-            if item.currency == self.cfg["capital"]["currency"] or item.currency == "BASE":
+        cfg_currency = self.cfg["capital"]["currency"]
+        for item in all_items:
+            if item.currency in (cfg_currency, "BASE"):
                 result[item.tag] = item.value
         return result
 
     def get_nav(self) -> float:
-        """Net asset value in account currency."""
+        """Net asset value in account currency.
+
+        Tries NetLiquidation first; falls back to configured capital.initial
+        so position sizing always has a valid number.
+        """
         summary = self.get_account_summary()
-        nav = summary.get("NetLiquidation") or summary.get("TotalCashValue", "0")
-        return float(nav)
+        for tag in ("NetLiquidation", "EquityWithLoanValue", "TotalCashBalance", "TotalCashValue"):
+            val = summary.get(tag)
+            if val:
+                try:
+                    nav = float(val)
+                    if nav > 0:
+                        return nav
+                except (ValueError, TypeError):
+                    pass
+
+        # Last resort: use configured capital allocation
+        configured = self.cfg["capital"].get("initial", 0)
+        if configured > 0:
+            log.warning(
+                "Could not read account NAV from IB Gateway — using configured "
+                "capital.initial = %.2f EUR as working capital.",
+                configured,
+            )
+            return float(configured)
+
+        return 0.0
 
     def get_daily_pnl(self) -> float:
         """Today's realised + unrealised P&L."""
@@ -186,13 +213,36 @@ class IBKRFeed:
         return results
 
     def qualify_contract(self, contract: Stock) -> bool:
-        """Ask IBKR to fill in missing contract details (conId, etc.). Returns True if valid."""
+        """Ask IBKR to fill in missing contract details (conId, etc.).
+
+        Tries the specific exchange first; if that fails (common on new paper
+        accounts without full exchange permissions), retries with SMART routing.
+        Returns True if the contract was qualified by either method.
+        """
         try:
             qualified = self.ib.qualifyContracts(contract)
-            return len(qualified) > 0
+            if len(qualified) > 0:
+                return True
         except Exception as e:
-            log.warning("Contract qualification failed for %s: %s", contract.symbol, e)
-            return False
+            log.debug("Contract qualification failed for %s on %s: %s",
+                      contract.symbol, contract.exchange, e)
+
+        # Retry with SMART routing — IBKR routes to the best available exchange
+        if contract.exchange != "SMART":
+            smart_contract = Stock(contract.symbol, "SMART", contract.currency)
+            try:
+                qualified = self.ib.qualifyContracts(smart_contract)
+                if len(qualified) > 0:
+                    # Copy resolved conId back so orders route correctly
+                    contract.conId = smart_contract.conId
+                    log.info("Contract %s qualified via SMART routing (conId=%s)",
+                             contract.symbol, contract.conId)
+                    return True
+            except Exception as e:
+                log.warning("Contract qualification failed for %s (SMART fallback): %s",
+                            contract.symbol, e)
+
+        return False
 
     def get_latest_price(self, contract: Stock, fallback_price: float = 0.0) -> float:
         """
@@ -204,11 +254,20 @@ class IBKRFeed:
           3. fallback_price (last known close from OHLCV cache)
 
         Paper accounts without subscriptions: IB Gateway returns frozen/delayed
-        data after reqMarketDataType(2) is set on connect.
+        data after reqMarketDataType(4) is set on connect.
+        Uses SMART routing for the data request to avoid error 200 on specific
+        exchanges that lack market data subscriptions.
         """
         try:
-            # snapshot=True: one-time request, no need to cancel manually
-            ticker = self.ib.reqMktData(contract, "", snapshot=False, regulatorySnapshot=False)
+            # Use SMART routing if the contract has a conId — avoids error 200
+            # on exchanges without a market data subscription.
+            if getattr(contract, "conId", 0) and contract.exchange != "SMART":
+                mkt_contract = Stock(contract.symbol, "SMART", contract.currency)
+                mkt_contract.conId = contract.conId
+            else:
+                mkt_contract = contract
+
+            ticker = self.ib.reqMktData(mkt_contract, "", snapshot=False, regulatorySnapshot=False)
 
             # Poll for up to 4 seconds
             for _ in range(8):
@@ -220,17 +279,17 @@ class IBKRFeed:
                         and not math.isnan(bid) and not math.isnan(ask)
                         and bid > 0 and ask > 0):
                     mid = (bid + ask) / 2
-                    self.ib.cancelMktData(contract)
+                    self.ib.cancelMktData(mkt_contract)
                     log.debug("Price %s: bid/ask mid = %.4f", contract.symbol, mid)
                     return float(mid)
 
                 # Last traded price
                 if last and not math.isnan(last) and last > 0:
-                    self.ib.cancelMktData(contract)
+                    self.ib.cancelMktData(mkt_contract)
                     log.debug("Price %s: last = %.4f", contract.symbol, last)
                     return float(last)
 
-            self.ib.cancelMktData(contract)
+            self.ib.cancelMktData(mkt_contract)
 
         except Exception as e:
             log.warning("reqMktData failed for %s: %s", contract.symbol, e)
