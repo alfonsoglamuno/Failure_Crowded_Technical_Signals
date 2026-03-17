@@ -165,14 +165,21 @@ class Journal:
         exit_date: date,
         pnl_gross: float,
         commission: float,
+        estimated: bool = False,
     ):
+        """
+        Record trade exit.
+        Set estimated=True when the exit price is from a live quote (not a real fill),
+        so that check_exits can override it with the actual fill price later.
+        """
         pnl_net = pnl_gross - commission
+        status = "pending_close" if estimated else "filled"
         with self._conn() as conn:
             conn.execute(
                 """UPDATE trades SET exit_price=?, exit_date=?,
-                   pnl_gross=?, pnl_net=?, status='filled'
+                   pnl_gross=?, pnl_net=?, status=?
                    WHERE id=?""",
-                (exit_price, str(exit_date), pnl_gross, pnl_net, trade_id),
+                (exit_price, str(exit_date), pnl_gross, pnl_net, status, trade_id),
             )
 
     def log_daily_summary(self, nav: float, daily_pnl: float,

@@ -398,15 +398,17 @@ def render_open_positions(open_trades: list[dict]) -> str:
     from datetime import datetime, timezone
     lines = [sep(),
              f"  {'Ticker':10}  {'Dir':4}  {'Entry':7}  {'SL':7}  {'TP':7}  "
-             f"{'SL%':6}  {'TP%':6}  {'Size EUR':>9}  {'Open h':>6}  Alert",
+             f"{'SL%':6}  {'TP%':6}  {'Size EUR':>9}  {'Open h':>6}  Status  Alert",
              sep()]
     now = datetime.now(timezone.utc)
+    naked_count = 0
     for t in open_trades:
         ep  = t.get("entry_price") or 0
         sl  = t.get("stop_loss") or 0
         tp  = t.get("take_profit") or 0
         inv = _invested(t)
         direction = t.get("trade_direction", "BUY")
+        status = t.get("status", "")
         sl_pct = (sl - ep) / ep if ep else 0
         tp_pct = (tp - ep) / ep if ep else 0
         try:
@@ -415,7 +417,15 @@ def render_open_positions(open_trades: list[dict]) -> str:
             hours_str = f"{hours_open:.1f}h"
         except Exception:
             hours_str = "  ?"
-        alert = str(t.get("alert_name") or "")[:20]
+        alert = str(t.get("alert_name") or "")[:18]
+        # Warn if stop is missing or position is pending_close
+        if status == "pending_close":
+            flag = "CLOSING"
+        elif not sl:
+            flag = "NO SL!"
+            naked_count += 1
+        else:
+            flag = "active"
         lines.append(
             f"  {str(t.get('ticker','?'))[:10]:10}  "
             f"{direction[:4]:4}  "
@@ -423,11 +433,14 @@ def render_open_positions(open_trades: list[dict]) -> str:
             f"{_pct(sl_pct):>6}  {_pct(tp_pct):>6}  "
             f"{inv:>9,.0f}  "
             f"{hours_str:>6}  "
-            f"{alert}"
+            f"{flag:7}  {alert}"
         )
     lines.append(sep())
     total_exp = sum(_invested(t) for t in open_trades)
-    lines.append(f"  Total exposure: {total_exp:,.0f} EUR  |  {len(open_trades)} open positions")
+    summary = f"  Total exposure: {total_exp:,.0f} EUR  |  {len(open_trades)} open positions"
+    if naked_count:
+        summary += f"  *** {naked_count} position(s) WITHOUT stop-loss — monitor will re-place ***"
+    lines.append(summary)
     lines.append(sep())
     return "\n".join(lines)
 

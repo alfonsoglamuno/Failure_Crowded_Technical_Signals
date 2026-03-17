@@ -23,7 +23,9 @@ risk:
   take_profit_pct: 0.025         # 2.5% TP — momentum continuation on oversold bounces averages 2-3%
   max_trades_per_day: 999        # no cap — trade as long as day is not a loss (gated by daily_loss + position slots)
   min_trade_size_eur: 500.0      # Min 500€ — meaningful enough to matter
-  commission_per_trade_eur: 5.0  # ~0.05% × 2000€ × 2 = ~2€ + fees, rounded up
+  commission_rate_pct: 0.05      # IBKR fee: 0.05% of trade value (tiered pricing)
+  commission_min_eur: 2.0        # IBKR minimum fee per order (~1.75–2 EUR for European stocks)
+  commission_per_trade_eur: 10.0 # legacy flat fallback (used only when trade value unknown)
 
   # Active position management
   trail_trigger_pct: 0.010       # 1.0% gain triggers trailing (0.5% was inside STOXX50 noise)
@@ -70,7 +72,7 @@ model:
   win_rate_target: 0.55               # Target hit rate
 
 data:
-  history_days: 504         # ~2 years of daily bars for bootstrap
+  history_days: 730         # 2 years of calendar days (~500 trading days) for bootstrap
   cache_dir: "data/cache"
   cache_max_age_hours: 20
 

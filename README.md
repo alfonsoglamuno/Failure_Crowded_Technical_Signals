@@ -67,6 +67,50 @@ Where `h ∈ {1, 3, 5}` days and `θ` is a minimum economically meaningful thres
 
 ---
 
+## Model Features
+
+Features are grouped into five categories and fed into XGBoost to predict P(signal failure).
+
+### Price & Momentum
+- Short-term and medium-term returns (1d, 5d, 20d)
+- RSI, MACD, Stochastic, Bollinger Band position
+- ATR-normalised volatility
+
+### Volume & Attention
+- Abnormal volume ratio
+- Gap size, large-candle flag
+
+### Market Regime (Index Correlation)
+Features derived from the EURO STOXX 50 index capture the macro environment and how closely each stock is moving with or against the market:
+
+| Feature | Description |
+|---------|-------------|
+| `index_ret_1d` | Index 1-day return (immediate momentum) |
+| `index_ret_5d` | Index 5-day return |
+| `index_ret_20d` | Index 20-day return (medium-term trend) |
+| `index_above_ma50` | Index above its 50-day moving average |
+| `index_above_ma200` | Index above its 200-day moving average (bull/bear regime) |
+| `index_corr_20d` | 20-day rolling correlation: stock return vs index return |
+| `index_corr_60d` | 60-day rolling correlation: stock return vs index return |
+| `beta_20d` | 20-day rolling beta (how much stock amplifies index moves) |
+| `beta_60d` | 60-day rolling beta |
+| `rel_strength_5d` | Stock 5-day return minus index 5-day return (outperformance) |
+| `rel_strength_20d` | Stock 20-day return minus index 20-day return |
+| `index_regime` | Categorical: +1 bull (index +2% over 20d), 0 neutral, -1 bear |
+
+> **Why this matters for FADE vs FOLLOW decisions:** A stock with high positive correlation (`index_corr_60d` near 1) and elevated beta (`beta_20d` > 1.5) will amplify index moves rather than revert independently — this context shifts the model's confidence in fading the signal. Conversely, a stock showing strong relative strength (`rel_strength_20d` > 0) in a bear regime (`index_regime = -1`) is behaving differently from the crowd, which is a meaningful predictor of whether a bearish alert will actually follow through.
+
+### Cross-Sectional
+- Rank of signal strength within the daily universe
+- Alert density (how many peers triggered the same alert)
+
+### Alert Properties
+- Alert type (18 types, encoded)
+- Alert direction (bullish / bearish)
+- Days since last alert of the same type
+
+---
+
 ## Models
 
 | Model | Purpose |

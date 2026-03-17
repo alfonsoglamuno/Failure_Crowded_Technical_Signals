@@ -19,12 +19,24 @@ def _tick_round(price: float) -> float:
     return round(round(price / tick) * tick, 4)
 
 
+def _estimate_commission(trade_value: float,
+                         rate: float = 0.0005,
+                         min_eur: float = 2.0) -> float:
+    """IBKR tiered: 0.05% of trade value, minimum 2 EUR."""
+    return max(min_eur, trade_value * rate)
+
+
 class PositionMonitor:
-    def __init__(self, ib: IB, journal, learner, commission: float = 1.75):
+    def __init__(self, ib: IB, journal, learner,
+                 commission: float = 10.0,
+                 commission_rate: float = 0.0005,
+                 commission_min: float = 2.0):
         self.ib = ib
         self.journal = journal
         self.learner = learner
-        self.commission = commission
+        self._commission_rate = commission_rate
+        self._commission_min  = commission_min
+        self.commission = commission  # legacy fallback when trade value unknown
 
     # ── Exit sync ──────────────────────────────────────────────────────────
 
@@ -60,14 +72,18 @@ class PositionMonitor:
             else:
                 pnl_gross = (entry_price - exit_price) * quantity
 
-            pnl_net = pnl_gross - self.commission
+            # Use actual IBKR commission if available; fall back to proportional estimate
+            trade_value = entry_price * quantity
+            commission = (exit_fill.get("commission")
+                          or _estimate_commission(trade_value, self._commission_rate, self._commission_min))
+            pnl_net = pnl_gross - commission
 
             self.journal.update_trade_exit(
                 trade_id=trade["id"],
                 exit_price=exit_price,
                 exit_date=date.today(),
                 pnl_gross=pnl_gross,
-                commission=self.commission,
+                commission=commission,
             )
 
             self.learner.record_outcome(
@@ -156,6 +172,33 @@ class PositionMonitor:
             log.info("[MONITOR] %s  px=%.4f  entry=%.4f  P&L=%.2f%%  open=%.1fh",
                      ticker, current_px, entry_px, unrealized_pct * 100, hours_open)
 
+            # ── Ensure SL exists ──────────────────────────────────────────
+            # If position has NO active stop order, re-place one.
+            # This protects naked positions after EOD bracket cancellation or reconnect.
+            if parent_id not in stop_trades:
+                sl_pct = cfg["risk"].get("stop_loss_pct", 0.015)
+                if direction == "BUY":
+                    sl_price = _tick_round(current_px * (1 - sl_pct))
+                else:
+                    sl_price = _tick_round(current_px * (1 + sl_pct))
+
+                from ib_insync import StopOrder
+                qty = int(rec.get("quantity", 0))
+                if qty > 0:
+                    sl_action = "SELL" if direction == "BUY" else "BUY"
+                    sl_order = StopOrder(sl_action, qty, sl_price)
+                    sl_order.tif      = "DAY"
+                    sl_order.parentId = parent_id
+                    if account:
+                        sl_order.account = account
+                    try:
+                        self.ib.placeOrder(contract, sl_order)
+                        log.warning("[SL-RESTORE] %s: re-placed missing SL @ %.4f "
+                                    "(%.1f%% from %.4f)",
+                                    ticker, sl_price, sl_pct * 100, current_px)
+                    except Exception as e:
+                        log.warning("[SL-RESTORE] Failed to re-place SL for %s: %s", ticker, e)
+
             # ── Trailing stop ──────────────────────────────────────────────
             if unrealized_pct >= trail_trigger:
                 if parent_id in stop_trades:
@@ -212,27 +255,35 @@ class PositionMonitor:
             log.info("[TIME EXIT] Market %s %d %s @ ~%.4f",
                      exit_action, qty, contract.symbol, current_px)
 
-        # Record estimated exit in journal
+        # Record ESTIMATED exit — marked pending_close so check_exits can
+        # override it with the real fill price on the next monitor cycle.
         entry_px  = rec.get("entry_price", current_px)
         pnl_gross = ((current_px - entry_px) * qty if direction == "BUY"
                      else (entry_px - current_px) * qty)
+        trade_value = entry_px * qty
+        commission = _estimate_commission(trade_value, self._commission_rate, self._commission_min)
         self.journal.update_trade_exit(
             trade_id=rec["id"],
             exit_price=current_px,
             exit_date=date.today(),
             pnl_gross=pnl_gross,
-            commission=self.commission,
+            commission=commission,
+            estimated=True,
         )
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
     def _get_open_journal_trades(self) -> list[dict]:
-        """Trades marked submitted/filled with no exit price yet."""
+        """
+        Trades with no confirmed exit:
+          - submitted/filled with no exit_price yet (normal open positions)
+          - pending_close: force-exited with estimated price, awaiting real fill
+        """
         all_trades = self.journal.get_recent_trades(n=50)
         return [
             t for t in all_trades
-            if t.get("status") in ("submitted", "filled")
-            and t.get("exit_price") is None
+            if (t.get("status") in ("submitted", "filled") and t.get("exit_price") is None)
+            or t.get("status") == "pending_close"
         ]
 
     def _get_filled_exit_orders(self) -> dict[int, dict]:
@@ -254,9 +305,16 @@ class PositionMonitor:
                     continue
                 if order.parentId not in result and trade.fills:
                     fill = trade.fills[-1].execution
+                    # Sum actual IBKR commissions from all partial fills
+                    actual_commission = sum(
+                        f.commissionReport.commission
+                        for f in trade.fills
+                        if f.commissionReport and f.commissionReport.commission > 0
+                    )
                     result[order.parentId] = {
                         "price": fill.avgPrice,
                         "fill_date": fill.time,
+                        "commission": actual_commission or None,  # None = fall back to config
                     }
 
             # ── Cross-session fallback: position-based detection ─────────────
@@ -270,7 +328,7 @@ class PositionMonitor:
                 if pos.position > 0
             }
             all_fills = self.ib.reqExecutions()
-            # Most recent SELL fill per symbol
+            # Most recent SELL fill per symbol + commission
             sell_fills: dict[str, dict] = {}
             for fi in all_fills:
                 exec_ = fi.execution
@@ -278,9 +336,13 @@ class PositionMonitor:
                 if side in ("SLD", "SELL"):
                     sym = fi.contract.symbol
                     if sym not in sell_fills:
+                        comm = 0.0
+                        if fi.commissionReport and fi.commissionReport.commission > 0:
+                            comm = fi.commissionReport.commission
                         sell_fills[sym] = {
                             "price": exec_.avgPrice,
                             "fill_date": exec_.time,
+                            "commission": comm or None,
                         }
 
             open_trades = self._get_open_journal_trades()

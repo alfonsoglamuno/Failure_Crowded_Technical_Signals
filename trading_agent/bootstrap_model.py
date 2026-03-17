@@ -202,7 +202,7 @@ def main(paper: bool = True, use_yfinance: bool = False):
 
     # ── Step 5: Train model ──────────────────────────────────────────────────
     from xgboost import XGBClassifier
-    from sklearn.metrics import roc_auc_score
+    from sklearn.metrics import roc_auc_score, precision_score
 
     split_idx = int(len(X) * 0.8)
     X_train, X_val = X.iloc[:split_idx], X.iloc[split_idx:]
@@ -212,9 +212,18 @@ def main(paper: bool = True, use_yfinance: bool = False):
     spw = neg / pos if pos > 0 else 1.0
 
     model = XGBClassifier(
-        n_estimators=500, max_depth=4, learning_rate=0.05,
-        subsample=0.8, colsample_bytree=0.8,
-        eval_metric="logloss", random_state=42, n_jobs=-1,
+        # More trees + early stopping avoids both under/over-fitting on 2-year dataset
+        n_estimators=1000,
+        early_stopping_rounds=50,
+        max_depth=5,           # one level deeper — captures regime × signal interactions
+        learning_rate=0.03,    # slower learning pairs with more trees
+        subsample=0.8,
+        colsample_bytree=0.7,  # slightly more aggressive feature dropout
+        min_child_weight=5,    # prevent overfitting on small leaf nodes
+        gamma=0.1,             # require minimum gain to split
+        eval_metric="auc",     # optimise directly for ranking (AUC), not logloss
+        random_state=42,
+        n_jobs=-1,
         scale_pos_weight=spw,
     )
     model.fit(X_train, y_train,
@@ -223,7 +232,16 @@ def main(paper: bool = True, use_yfinance: bool = False):
 
     val_proba = model.predict_proba(X_val)[:, 1]
     auc = roc_auc_score(y_val, val_proba)
-    log.info("Validation ROC-AUC: %.4f", auc)
+    log.info("Validation ROC-AUC: %.4f  (best iteration: %d)",
+             auc, model.best_iteration)
+
+    # Report precision at the operating thresholds
+    for t in [0.55, 0.60, 0.65, 0.70]:
+        pred = (val_proba >= t).astype(int)
+        n = int(pred.sum())
+        if n > 0:
+            prec = precision_score(y_val, pred, zero_division=0)
+            log.info("  threshold=%.2f  signals=%4d  precision=%.3f", t, n, prec)
 
     # ── Step 6: Save model and feature cols ──────────────────────────────────
     model_dir = Path(cfg["model"]["path"]).parent

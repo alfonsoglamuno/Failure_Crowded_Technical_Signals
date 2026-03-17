@@ -43,6 +43,45 @@ _MARKET_CLOSE = dtime(17, 0)
 # GBP-denominated tickers — skip for EUR sizing (exchange rate not applied)
 _GBP_TICKERS = {"CRH.L", "FLTR.L", "NG.L"}
 
+_PEER_CORR_THRESHOLD = 0.70   # skip candidate if corr with any open position exceeds this
+_PEER_CORR_WINDOW    = 20     # trading days for correlation lookback
+
+
+def _max_corr_with_open(candidate: str, open_tickers: set[str],
+                         universe_data: dict) -> float:
+    """
+    Return the maximum 20-day return correlation between `candidate` and any
+    currently-open position. Used to avoid concentrating correlated exposure.
+
+    Returns 0.0 if open_tickers is empty or data is insufficient.
+    """
+    if not open_tickers or candidate not in universe_data:
+        return 0.0
+
+    import pandas as pd
+    cand_df = universe_data[candidate]
+    if "close" not in cand_df.columns or len(cand_df) < _PEER_CORR_WINDOW + 2:
+        return 0.0
+
+    cand_ret = cand_df["close"].pct_change().dropna().tail(_PEER_CORR_WINDOW * 2)
+    max_corr = 0.0
+
+    for open_t in open_tickers:
+        if open_t not in universe_data:
+            continue
+        peer_df = universe_data[open_t]
+        if "close" not in peer_df.columns or len(peer_df) < _PEER_CORR_WINDOW + 2:
+            continue
+        peer_ret = peer_df["close"].pct_change().dropna().tail(_PEER_CORR_WINDOW * 2)
+        aligned = pd.concat([cand_ret, peer_ret], axis=1, join="inner")
+        if len(aligned) < _PEER_CORR_WINDOW:
+            continue
+        corr = float(aligned.iloc[:, 0].corr(aligned.iloc[:, 1]))
+        if not __import__("math").isnan(corr):
+            max_corr = max(max_corr, abs(corr))
+
+    return max_corr
+
 
 def is_market_open(now: datetime | None = None) -> bool:
     """Returns True if we are inside European market hours on a weekday."""
@@ -300,30 +339,34 @@ def run_once(paper: bool, cfg: dict):
         log.info("Actionable signals: %d", len(signals))
 
         # ── Execute ───────────────────────────────────────────────────────────
-        executor = IBKRExecutor(feed.ib, contracts_cfg, paper=paper, account=feed.account_id)
+        executor = IBKRExecutor(
+            feed.ib, contracts_cfg, paper=paper, account=feed.account_id,
+            allow_short=cfg["strategy"].get("allow_short", False),
+        )
         n_trades = 0
 
-        # Dedup: don't re-trade a ticker that already has an open order today.
-        # "date" is the column name in the trades table (not "trade_date").
+        # Dedup: don't re-trade a ticker that still has an active (unclosed) trade today.
+        # Includes filled trades with no exit yet (position open but SL/TP pending).
         already_traded_today = {
             t["ticker"] for t in journal.get_recent_trades(100)
             if str(t.get("date", "")) == str(today)
-               and t.get("status") in ("submitted", "open", "pending")
+               and t.get("status") in ("submitted", "open", "pending", "filled")
+               and t.get("exit_price") is None
         }
         if already_traded_today:
             log.info("Already traded today: %s — will not re-enter", sorted(already_traded_today))
 
         # Build set of tickers already active in IBKR:
-        #   - filled positions (pos.position > 0)
+        #   - any non-zero positions (long OR short — shorts block new long entries)
         #   - pending/submitted orders (PendingSubmit, Submitted, PreSubmitted)
         # Both must be excluded to prevent double-entry across scans.
         open_ibkr_positions: set[str] = set()
         try:
             symbol_to_yahoo = {v["symbol"]: k for k, v in contracts_cfg.items()}
 
-            # Filled positions
+            # Filled positions (long or short — both block new entries)
             for pos in feed.ib.positions():
-                if pos.position > 0:
+                if abs(pos.position) > 0:
                     yahoo = symbol_to_yahoo.get(pos.contract.symbol, "")
                     if yahoo:
                         open_ibkr_positions.add(yahoo)
@@ -368,6 +411,17 @@ def run_once(paper: bool, cfg: dict):
             # Don't add to an existing long position
             if sig.ticker in open_ibkr_positions:
                 log.info("Skipping %s — already holding long position", sig.ticker)
+                continue
+
+            # Correlation gate — avoid concentrating correlated positions.
+            # If the candidate is highly correlated (>0.70) with any open position,
+            # adding it is just leveraging the same factor — skip it.
+            max_corr = _max_corr_with_open(sig.ticker, open_ibkr_positions, universe_data)
+            if max_corr >= _PEER_CORR_THRESHOLD:
+                log.info(
+                    "Skipping %s — max corr with open positions %.2f >= %.2f threshold",
+                    sig.ticker, max_corr, _PEER_CORR_THRESHOLD,
+                )
                 continue
 
             # Stop adding once we've filled all available slots this scan
@@ -469,7 +523,8 @@ def _monitor_open_positions(paper: bool, cfg: dict):
     # Fast check — avoid connecting to IBKR if nothing is open
     open_trades = [
         t for t in journal.get_recent_trades(50)
-        if t.get("status") in ("submitted", "filled") and t.get("exit_price") is None
+        if t.get("status") in ("submitted", "filled", "pending_close")
+        and t.get("exit_price") is None or t.get("status") == "pending_close"
     ]
     if not open_trades:
         log.debug("No open trades — skipping position monitor")
@@ -489,6 +544,8 @@ def _monitor_open_positions(paper: bool, cfg: dict):
         monitor = PositionMonitor(
             feed.ib, journal, learner,
             commission=cfg["risk"]["commission_per_trade_eur"],
+            commission_rate=cfg["risk"].get("commission_rate_pct", 0.05) / 100,
+            commission_min=cfg["risk"].get("commission_min_eur", 2.0),
         )
         monitor.check_exits()
         monitor.monitor_positions(
@@ -503,11 +560,136 @@ def _monitor_open_positions(paper: bool, cfg: dict):
         feed.disconnect()
 
 
-def _eod_close(paper: bool, cfg: dict):
-    """Cancel all bracket orders and close open long positions with market orders."""
+def _evaluate_overnight_positions(paper: bool, cfg: dict):
+    """
+    Run once at market open if journal has positions from previous session.
+
+    For each overnight position:
+      1. Check if it's still valid in IBKR (position > 0).
+      2. Ensure a stop-loss order exists at a sensible level.
+         If SL is missing (e.g. bracket cancelled by EOD), re-place it.
+      3. Log a warning for accidental short positions (should be covered).
+
+    This does NOT make trading decisions — it just protects open positions
+    until the first full signal scan runs and can evaluate them properly.
+    """
     from agent.data_feed import IBKRFeed, load_contracts
+    from agent.journal import Journal
+    from ib_insync import Stock, StopOrder
+    from datetime import date
+
+    journal = Journal(cfg["journal"]["db_path"])
+    today = date.today()
+
+    open_trades = [
+        t for t in journal.get_recent_trades(50)
+        if t.get("status") in ("submitted", "filled")
+        and t.get("exit_price") is None
+        and str(t.get("date", "")) != str(today)   # from previous day
+    ]
+    if not open_trades:
+        return
+
+    log.warning("Found %d overnight positions from previous session — evaluating", len(open_trades))
+    contracts_cfg = load_contracts(cfg["universe"]["ibkr_contracts_file"])
+
+    feed = IBKRFeed(cfg, paper=paper)
+    try:
+        feed.connect()
+        ib = feed.ib
+        ib.sleep(2)
+        account = feed.account_id
+
+        # Map IBKR symbol → current position qty
+        ibkr_positions = {
+            pos.contract.symbol: pos.position
+            for pos in ib.positions()
+        }
+
+        # Existing SL orders keyed by parentId
+        ib.reqAllOpenOrders()
+        ib.sleep(1)
+        existing_stops = {
+            t.order.parentId: t.order.auxPrice
+            for t in ib.trades()
+            if getattr(t.order, "orderType", "") == "STP"
+            and getattr(t.order, "parentId", 0)
+            and t.orderStatus.status not in ("Filled", "Cancelled", "Inactive")
+        }
+
+        sl_pct = cfg["risk"].get("stop_loss_pct", 0.015)
+
+        for rec in open_trades:
+            ticker    = rec.get("ticker", "")
+            symbol    = rec.get("ibkr_symbol", "")
+            parent_id = rec.get("ibkr_order_id")
+            direction = rec.get("trade_direction", "BUY")
+            qty       = int(rec.get("quantity", 0))
+            entry_px  = rec.get("entry_price", 0)
+
+            ibkr_qty = ibkr_positions.get(symbol, 0)
+
+            if ibkr_qty == 0:
+                # Position already closed in IBKR but journal not updated — will be
+                # reconciled by check_exits; nothing to do here
+                log.info("Overnight %s: IBKR shows 0 position — check_exits will reconcile", ticker)
+                continue
+
+            if ibkr_qty < 0:
+                log.warning("Overnight %s: accidental SHORT (%d shares) — covering at open", ticker, ibkr_qty)
+                spec = contracts_cfg.get(ticker)
+                if spec:
+                    contract = Stock(spec["symbol"], "SMART", spec["currency"])
+                    from ib_insync import MarketOrder
+                    order = MarketOrder("BUY", abs(ibkr_qty))
+                    order.account = account
+                    order.tif = "DAY"
+                    ib.placeOrder(contract, order)
+                continue
+
+            # Check SL
+            if parent_id in existing_stops:
+                log.info("Overnight %s: SL already active @ %.4f", ticker, existing_stops[parent_id])
+                continue
+
+            # SL missing — re-place at current price - SL%
+            spec = contracts_cfg.get(ticker)
+            if not spec:
+                log.warning("Overnight %s: no contract spec — cannot re-place SL", ticker)
+                continue
+
+            contract = Stock(spec["symbol"], "SMART", spec["currency"])
+            current_px = feed.get_latest_price(contract, fallback_price=entry_px)
+
+            if direction == "BUY":
+                sl_price = round(current_px * (1 - sl_pct), 2)
+                sl_order = StopOrder("SELL", qty, sl_price)
+            else:
+                sl_price = round(current_px * (1 + sl_pct), 2)
+                sl_order = StopOrder("BUY", qty, sl_price)
+
+            sl_order.account  = account
+            sl_order.tif      = "DAY"
+            sl_order.parentId = parent_id
+            ib.placeOrder(contract, sl_order)
+            log.warning("Overnight %s: re-placed SL @ %.4f (%.1f%% from %.4f)",
+                        ticker, sl_price, sl_pct * 100, current_px)
+
+        ib.sleep(2)
+    except Exception as e:
+        log.error("Overnight position evaluation failed: %s", e)
+    finally:
+        feed.disconnect()
+
+
+def _eod_close(paper: bool, cfg: dict):
+    """Cancel all bracket orders and close all open positions with market orders.
+
+    Handles both longs (SELL) and accidental shorts (BUY to cover).
+    Uses ib.positions() after a settle sleep to ensure complete position data.
+    """
+    from agent.data_feed import IBKRFeed
     from ib_insync import MarketOrder
-    import os
     from dotenv import load_dotenv
     load_dotenv()
 
@@ -517,30 +699,52 @@ def _eod_close(paper: bool, cfg: dict):
         ib = feed.ib
         account = feed.account_id
 
-        # Cancel all open orders (TP/SL brackets)
+        # Give IBKR time to push all position/order data after reconnect
+        ib.sleep(2)
+
+        # Cancel all open orders (TP/SL brackets and any stale orders)
         open_orders = ib.reqAllOpenOrders()
         ib.sleep(1)
+        cancelled = 0
         for t in open_orders:
             try:
                 ib.cancelOrder(t.order)
+                cancelled += 1
             except Exception:
                 pass
         ib.sleep(2)
-        log.info("Cancelled %d open bracket orders", len(open_orders))
+        log.info("Cancelled %d open orders", cancelled)
 
-        # Close all long positions with market orders
+        # Close all non-zero positions
         positions = ib.positions()
-        closed = 0
+        closed_long = 0
+        closed_short = 0
         for pos in positions:
-            if pos.position > 0:
-                order = MarketOrder("SELL", int(pos.position))
+            qty = int(pos.position)
+            if qty == 0:
+                continue
+            if qty > 0:
+                # Long: sell to close
+                order = MarketOrder("SELL", qty)
                 order.account = account
                 order.tif = "DAY"
                 ib.placeOrder(pos.contract, order)
-                log.info("EOD close: SELL %d %s", int(pos.position), pos.contract.symbol)
-                closed += 1
+                log.info("EOD close LONG: SELL %d %s", qty, pos.contract.symbol)
+                closed_long += 1
+            else:
+                # Short (accidental): buy to cover
+                order = MarketOrder("BUY", abs(qty))
+                order.account = account
+                order.tif = "DAY"
+                ib.placeOrder(pos.contract, order)
+                log.warning("EOD close SHORT: BUY %d %s (accidental short — covering)",
+                            abs(qty), pos.contract.symbol)
+                closed_short += 1
+
         ib.sleep(3)
-        log.info("EOD close complete — %d positions closed", closed)
+        log.info("EOD close complete — %d longs closed, %d shorts covered",
+                 closed_long, closed_short)
+
     except Exception as e:
         log.error("EOD close failed: %s", e)
     finally:
@@ -603,7 +807,8 @@ def main():
         eod_str,
     )
 
-    last_scan_time = 0.0   # force immediate scan on startup
+    last_scan_time    = 0.0    # force immediate scan on startup
+    overnight_checked = False  # run overnight check once per market open
 
     while True:
         now = datetime.now(CET)
@@ -612,10 +817,22 @@ def main():
         if now.weekday() < 5 and now.hour == eod_h and now.minute >= eod_m and now.minute < eod_m + 5:
             log.info("EOD close time reached (%s CET) — closing all open positions", eod_str)
             _eod_close(paper=not args.live, cfg=cfg)
+            overnight_checked = False   # reset so next day's open triggers check
             time.sleep(300)   # sleep past the 5-min window
             continue
 
         if is_market_open(now):
+            # ── MORNING PRIORITY: evaluate any overnight positions FIRST ──────
+            # Always runs before any new signal scan or trade placement.
+            # Covers shorts (cover immediately), missing SLs (re-place), and
+            # positions that were closed by IBKR SL/TP while agent was offline.
+            if not overnight_checked:
+                log.info("=== Morning check: evaluating overnight positions ===")
+                _evaluate_overnight_positions(paper=not args.live, cfg=cfg)
+                overnight_checked = True
+                log.info("=== Morning check complete ===")
+
+
             # Fast loop — always runs (trail stops, time exits, exit sync)
             _monitor_open_positions(paper=not args.live, cfg=cfg)
 
@@ -624,6 +841,7 @@ def main():
                 run_once(paper=not args.live, cfg=cfg)
                 last_scan_time = time.time()
         else:
+            overnight_checked = False   # market closed — reset flag for next open
             log.info("Market closed at %s — waiting...", now.strftime("%H:%M CET"))
 
         time.sleep(monitor_interval)

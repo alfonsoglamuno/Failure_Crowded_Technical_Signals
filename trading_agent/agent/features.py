@@ -26,6 +26,7 @@ from src.features.engineering import (
     add_volume_features,
     add_calendar_features,
     add_regime_features,
+    add_peer_correlation_feature,
 )
 
 log = logging.getLogger(__name__)
@@ -93,6 +94,31 @@ def build_feature_row(
         return pd.DataFrame()
 
     result = pd.DataFrame(rows)
+
+    # Block G: inter-stock peer correlation — requires all tickers together.
+    # Build a minimal panel (date + ticker + close) from universe_data,
+    # then compute avg_peer_corr_20d and join the today-row value into result.
+    try:
+        panel_frames = []
+        for t, df in universe_data.items():
+            if "close" in df.columns and "date" in df.columns:
+                tmp = df[["date", "close"]].copy()
+                tmp["ticker"] = t
+                panel_frames.append(tmp.tail(60))   # only need recent history
+        if panel_frames:
+            mini_panel = pd.concat(panel_frames, ignore_index=True)
+            mini_panel["date"] = pd.to_datetime(mini_panel["date"])
+            corr_panel = add_peer_correlation_feature(mini_panel, window=20)
+            # Grab the latest avg_peer_corr_20d per ticker
+            latest_corr = (
+                corr_panel.sort_values("date")
+                .groupby("ticker")["avg_peer_corr_20d"]
+                .last()
+            )
+            result["avg_peer_corr_20d"] = result["ticker"].map(latest_corr)
+    except Exception as e:
+        log.warning("Peer correlation feature failed: %s — filling with NaN", e)
+        result["avg_peer_corr_20d"] = np.nan
 
     # Preserve raw labels before one-hot encoding (used by signal logger)
     result["_dir_raw"] = result["direction"]

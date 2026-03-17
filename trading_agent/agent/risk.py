@@ -19,7 +19,12 @@ class RiskManager:
         self.stop_loss_pct = r["stop_loss_pct"]
         self.take_profit_pct = r["take_profit_pct"]
         self.min_trade_eur = r["min_trade_size_eur"]
-        self.commission = r["commission_per_trade_eur"]
+        self._commission_rate = r.get("commission_rate_pct", 0.05) / 100
+        self._commission_min  = r.get("commission_min_eur", 2.0)
+
+    def estimate_commission(self, trade_value: float) -> float:
+        """IBKR tiered: 0.05% of trade value, minimum 2 EUR."""
+        return max(self._commission_min, trade_value * self._commission_rate)
 
     def check_daily_loss(self, daily_pnl: float) -> bool:
         """Returns True if we can still trade today."""
@@ -78,12 +83,13 @@ class RiskManager:
             )
             return None
 
-        # Net expected return after commission
+        # Net expected return after commission (entry + exit both charged)
         expected_gross = quantity * abs(take_profit - entry)
-        if expected_gross < self.commission * 2:
+        round_trip_commission = self.estimate_commission(position_value) * 2
+        if expected_gross < round_trip_commission:
             log.info(
-                "Expected gross (%.2f EUR) < 2x commission for %s — skipping",
-                expected_gross, signal.ticker
+                "Expected gross (%.2f EUR) < round-trip commission (%.2f EUR) for %s — skipping",
+                expected_gross, round_trip_commission, signal.ticker
             )
             return None
 

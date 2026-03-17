@@ -29,11 +29,13 @@ class OrderResult:
 
 
 class IBKRExecutor:
-    def __init__(self, ib: IB, contracts_cfg: dict, paper: bool = True, account: str = ""):
+    def __init__(self, ib: IB, contracts_cfg: dict, paper: bool = True,
+                 account: str = "", allow_short: bool = False):
         self.ib = ib
         self.contracts_cfg = contracts_cfg
         self.paper = paper
-        self.account = account   # IBKR account ID — set on every order for correctness
+        self.account = account       # IBKR account ID — set on every order for correctness
+        self.allow_short = allow_short
 
     def _make_contract(self, yahoo_ticker: str) -> Optional[Stock]:
         spec = self.contracts_cfg.get(yahoo_ticker)
@@ -58,6 +60,31 @@ class IBKRExecutor:
         Pass a pre-qualified `contract` from run_agent to skip re-lookup and
         benefit from the conId already resolved by qualifyContracts().
         """
+        # ── Hard safety: block short entries unconditionally unless explicitly enabled ──
+        # The agent's design is LONG-only (fading = BUY the dip, not shorting the spike).
+        # Any SELL entry here means a short position — which IBKR may fill but cannot
+        # be borrowed reliably on European stocks. Block it hard so config bugs or
+        # signal inversions cannot accidentally create short positions.
+        if trade_direction == "SELL" and not self.allow_short:
+            log.error(
+                "BLOCKED short entry for %s — allow_short=False. "
+                "Only SELL exits (SL/TP/EOD) are permitted, not new short entries.",
+                yahoo_ticker,
+            )
+            return OrderResult(
+                yahoo_ticker=yahoo_ticker,
+                ibkr_symbol="",
+                action=action,
+                trade_direction=trade_direction,
+                quantity=quantity,
+                entry_price=entry_price,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                parent_order_id=-1,
+                status="error",
+                error_msg="Short entries disabled (allow_short=False in config)",
+            )
+
         if contract is None:
             contract = self._make_contract(yahoo_ticker)
         if contract is None:

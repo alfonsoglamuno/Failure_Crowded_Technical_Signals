@@ -82,7 +82,17 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-### Step 2 — Start trading (Windows)
+### Step 2 — Bootstrap the model (required before first run)
+
+The model must be trained before the agent can trade. Run once, and again whenever features change:
+
+```bash
+python bootstrap_model.py --yfinance
+```
+
+> **Important:** If new features have been added to `src/features/engineering.py` (e.g. the index correlation features), you must rerun bootstrap to regenerate the feature table with the new columns. The agent will refuse to start if the saved feature list does not match the current feature set.
+
+### Step 3 — Start trading (Windows)
 
 ```bat
 start.bat              # scheduled paper trading at 09:15 CET (default)
@@ -92,7 +102,7 @@ start.bat status       # print quick performance summary
 start.bat live         # !! real money — confirm required !!
 ```
 
-### Step 2 — Start trading (Linux / macOS)
+### Step 3 — Start trading (Linux / macOS)
 
 ```bash
 chmod +x start.sh
@@ -141,6 +151,64 @@ Shows:
 
 ---
 
+## Intraday-Only Trading Policy
+
+The agent is strictly **intraday**: all positions are closed by end of day. No overnight exposure is taken intentionally.
+
+### EOD Close (end of session)
+- At market close, the agent cancels all open bracket orders and flattens all positions
+- This covers both long positions and any accidental short positions (buy to cover)
+
+### Overnight Position Recovery (market open)
+- At market open, `_evaluate_overnight_positions()` runs automatically
+- If any positions survived overnight (should not happen under normal operation), the agent:
+  1. Re-places missing stop-loss orders for surviving long positions
+  2. Covers (buys to close) any accidental short positions immediately
+- This acts as a safety net, not normal operating mode
+
+### Mid-Session SL Monitoring
+- The monitor checks stop-loss orders throughout the session
+- If an SL order goes missing (e.g. cancelled by IBKR due to margin or connectivity), it is automatically re-placed
+- This prevents positions from being left unprotected
+
+---
+
+## Duplicate Trade Prevention
+
+Two independent guards prevent entering the same stock twice in a session:
+
+1. **`already_traded_today`** — blocks re-entry on any ticker that has a `filled` trade with no exit recorded yet in the journal
+2. **`open_ibkr_positions`** — blocks on any non-zero IBKR position (long or short) for that ticker, checked live against the broker
+
+Both guards must clear before the agent will submit a new bracket order.
+
+---
+
+## Position Management Utility (`close_shorts.py`)
+
+`trading_agent/close_shorts.py` is a standalone script for manual position management outside the normal agent cycle. Use it to intervene when needed.
+
+```bash
+# Cover specific tickers (buy to close short positions)
+python close_shorts.py --ticker BMW.DE DB1.DE
+
+# Cover all short positions in the account
+python close_shorts.py --shorts-only
+
+# Emergency: close everything (longs and shorts)
+python close_shorts.py --emergency
+```
+
+By default the script operates on the **paper account**. Add `--live` to act on the live account:
+
+```bash
+python close_shorts.py --shorts-only --live
+```
+
+> Use `--emergency` with caution. It will market-close all open positions regardless of P&L.
+
+---
+
 ## Risk Configuration (`configs/config.yaml`)
 
 Current settings for trial / paper account:
@@ -152,12 +220,17 @@ Current settings for trial / paper account:
 | Stop-loss | 2% | |
 | Take-profit | 4% | 2:1 risk/reward |
 | Max trades/day | 5 | FADE both long and short |
-| Commission (est.) | 5 EUR | 0.05% × 2,000 EUR × 2 = ~2 EUR + exchange fees |
+| Commission | actual fill | Uses IBKR execution fill data; falls back to config estimate when unavailable |
+| Commission (est.) | 5 EUR | Fallback: 0.05% × 2,000 EUR × 2 = ~2 EUR + exchange fees |
 | Max daily loss | 300 EUR | 0.3% of capital |
 | Fade threshold | 0.60 | P(failure) ≥ 0.60 → trade |
 | Follow disabled | true | Enable after 50+ FADE trades |
 
 Break-even: **37.5% hit rate** needed. Model delivers **69.6%** on FADE signals.
+
+### Commission Tracking
+
+Commissions are recorded from **actual IBKR execution fills** when available. This gives accurate cost accounting without relying on estimates. When fill data does not include commission detail (e.g. certain order types or connectivity gaps), the agent falls back to the `commission_estimate` value in `config.yaml`. Check the journal to verify which method was used for each trade.
 
 ---
 
@@ -186,6 +259,7 @@ trading_agent/
 ├── run_agent.py            ← Main agent entry point
 ├── bootstrap_model.py      ← One-time model training
 ├── dashboard.py            ← Live P&L monitor
+├── close_shorts.py         ← Manual position management utility
 ├── .env                    ← IBKR credentials (gitignored)
 ├── configs/
 │   ├── config.yaml         ← All settings
@@ -199,7 +273,7 @@ trading_agent/
 │   ├── executor.py         ← IBKR bracket orders
 │   ├── journal.py          ← SQLite trade log
 │   ├── learner.py          ← Threshold recalibration + retrain
-│   ├── monitor.py          ← Detects closed bracket orders
+│   ├── monitor.py          ← Detects closed bracket orders, re-places missing SL orders
 │   └── data_feed.py        ← IBKR connection + OHLCV fetch
 └── data/
     ├── model/              ← Trained model + feature list (gitignored)
@@ -240,6 +314,14 @@ crontab -e
 python bootstrap_model.py --yfinance
 ```
 
+**"Feature mismatch" or model refuses to load**
+
+New features were added (e.g. index correlation features). Rerun bootstrap to retrain on the updated feature set:
+```bash
+cd trading_agent
+python bootstrap_model.py --yfinance
+```
+
 **"Could not connect to IB Gateway"**
 - Make sure IB Gateway is open and you're logged into your paper account
 - Check API is enabled on port 4002
@@ -248,6 +330,16 @@ python bootstrap_model.py --yfinance
 **"No alerts today"**
 - Normal — some days have no qualifying signals
 - Agent logs this and exits cleanly
+
+**Accidental short position left open**
+```bash
+python close_shorts.py --shorts-only
+```
+
+**Need to flatten everything immediately**
+```bash
+python close_shorts.py --emergency
+```
 
 **Check the log**
 ```bash
