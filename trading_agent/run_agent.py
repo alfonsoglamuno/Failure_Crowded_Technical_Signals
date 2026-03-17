@@ -284,27 +284,42 @@ def run_once(paper: bool, cfg: dict):
         n_trades = 0
 
         # Dedup: don't re-trade a ticker that already has an open order today.
-        # Handles the case where the agent runs multiple times per day.
+        # "date" is the column name in the trades table (not "trade_date").
         already_traded_today = {
             t["ticker"] for t in journal.get_recent_trades(100)
-            if str(t.get("trade_date", "")) == str(today)
+            if str(t.get("date", "")) == str(today)
                and t.get("status") in ("submitted", "open", "pending")
         }
         if already_traded_today:
             log.info("Already traded today: %s — will not re-enter", sorted(already_traded_today))
 
-        # Build set of tickers currently held long in IBKR (don't double-enter)
+        # Build set of tickers already active in IBKR:
+        #   - filled positions (pos.position > 0)
+        #   - pending/submitted orders (PendingSubmit, Submitted, PreSubmitted)
+        # Both must be excluded to prevent double-entry across scans.
         open_ibkr_positions: set[str] = set()
         try:
-            # reverse-map IBKR symbol -> yahoo ticker
             symbol_to_yahoo = {v["symbol"]: k for k, v in contracts_cfg.items()}
+
+            # Filled positions
             for pos in feed.ib.positions():
                 if pos.position > 0:
                     yahoo = symbol_to_yahoo.get(pos.contract.symbol, "")
                     if yahoo:
                         open_ibkr_positions.add(yahoo)
+
+            # Pending / live parent orders (not yet filled)
+            for trade in feed.ib.trades():
+                status = trade.orderStatus.status
+                if status in ("PendingSubmit", "Submitted", "PreSubmitted", "Filled"):
+                    if not getattr(trade.order, "parentId", 0):  # parent orders only
+                        yahoo = symbol_to_yahoo.get(trade.contract.symbol, "")
+                        if yahoo:
+                            open_ibkr_positions.add(yahoo)
+
             if open_ibkr_positions:
-                log.info("Currently holding long positions: %s", sorted(open_ibkr_positions))
+                log.info("Active in IBKR (positions + pending orders): %s",
+                         sorted(open_ibkr_positions))
         except Exception:
             pass
 
