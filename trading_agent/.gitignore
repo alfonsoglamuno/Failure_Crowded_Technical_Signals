@@ -15,3 +15,6 @@ configs/live_config.yaml
 __pycache__/
 *.pyc
 .venv/
+
+start_morning.ps1
+install_task.ps1

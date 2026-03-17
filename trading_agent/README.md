@@ -3,6 +3,10 @@
 ML-driven paper trading agent for EURO STOXX 50 stocks.
 Predicts when technical alerts will **fail** and trades the reversal.
 
+> **Instrument scope: cash equities only.**
+> This agent trades **shares (stocks) exclusively** using bracket orders (market entry + limit take-profit + stop-loss).
+> Options, futures, CFDs, and all other derivatives are **not used and not required**. No options trading permissions are needed.
+
 ---
 
 ## How It Works
@@ -39,7 +43,8 @@ IBKR data ──► Alert Detection ──► Feature Engineering ──► XGBo
 ## Prerequisites
 
 1. **Python 3.10+** — [python.org](https://www.python.org/downloads/)
-2. **IB Gateway** — download at:
+2. **IBKR account permissions needed:** stock trading on European exchanges only. **No options permissions required.**
+3. **IB Gateway** — download at:
    `https://www.interactivebrokers.com/en/trading/ibgateway-stable.html`
 
    First-time IB Gateway setup:
@@ -257,7 +262,12 @@ tail -f data/agent.log  # Linux/Mac
 After 2–4 weeks of paper trading with satisfactory results:
 
 1. Switch IB Gateway to **Live** account
-2. Verify funds and permissions
+2. Verify funds and permissions for **European stock trading** (no options permissions needed)
 3. Run: `start.bat live` (will ask for confirmation)
+
+Required IBKR permissions for live:
+- Trading permissions: **Stocks** on European exchanges (XETRA, Euronext, LSE, etc.)
+- Market data: European equities delayed or real-time
+- **Options trading is not used — do not enable it**
 
 > Strongly recommended: maintain paper trading alongside live for comparison.

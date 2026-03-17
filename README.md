@@ -99,10 +99,14 @@ Where `h ∈ {1, 3, 5}` days and `θ` is a minimum economically meaningful thres
 | Parameter | Value |
 |-----------|-------|
 | Universe | EURO STOXX 50 constituents (daily) |
+| Instrument | **Cash equities only — no options, no futures, no derivatives** |
+| Order types | Market entry + Limit take-profit + Stop-loss (bracket orders) |
 | Horizons | 1, 3, 5 days |
 | Main model | XGBoost |
 | Validation | Walk-forward with purging/embargo |
 | Primary output | Ranked contrarian opportunity scores |
+
+> **Note:** This project trades **cash stocks only**. Options trading is explicitly out of scope and not implemented. No options permissions are required.
 
 ---
 
