@@ -3,6 +3,7 @@ Trading report — daily, weekly, monthly performance summaries.
 
 All P&L figures are NET of commissions.
 Return % is always relative to capital actually deployed (entry_price × quantity).
+Each period shows benchmark comparison vs Euro STOXX 50 index (^STOXX50E).
 
 Usage:
     python report.py                  # today
@@ -21,6 +22,48 @@ from pathlib import Path
 
 DB_PATH = "data/journal.db"
 W = 76
+INDEX_TICKER = "^STOXX50E"    # Euro STOXX 50 — our benchmark
+
+
+# ── Benchmark (Euro STOXX 50) ──────────────────────────────────────────────────
+
+def _fetch_index_return(start: date, end: date) -> float | None:
+    """
+    Return the Euro STOXX 50 price return for [start, end] as a fraction.
+    Uses yfinance with a 1-day buffer so we always get the open of `start`.
+    Returns None if data is unavailable (e.g. weekend, no internet).
+    """
+    try:
+        import yfinance as yf
+        from datetime import timedelta as td
+        # Download one extra day before start to get the prior close
+        fetch_start = start - td(days=5)   # 5-day buffer covers weekends/holidays
+        fetch_end   = end   + td(days=1)
+        df = yf.download(INDEX_TICKER, start=str(fetch_start), end=str(fetch_end),
+                         progress=False, auto_adjust=True)
+        if df is None or df.empty:
+            return None
+        # Normalise MultiIndex columns produced by newer yfinance versions
+        if isinstance(df.columns, __import__("pandas").MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        close = df["Close"].dropna()
+        if len(close) < 2:
+            return None
+        # Find the last trading day on or before `start` → that is our base
+        base_candidates = close[close.index.date <= start]
+        end_candidates  = close[close.index.date <= end]
+        if base_candidates.empty or end_candidates.empty:
+            return None
+        base_price = float(base_candidates.iloc[-1])
+        end_price  = float(end_candidates.iloc[-1])
+        if base_price == 0:
+            return None
+        # For single-day reports the base is the previous close, so return
+        # can be computed even if start == end (intraday not available here,
+        # so we use prev-close → close of that day).
+        return (end_price - base_price) / base_price
+    except Exception:
+        return None
 
 
 def _conn(db_path: str) -> sqlite3.Connection:
@@ -193,9 +236,35 @@ def by_alert(trades: list[dict]) -> dict[str, dict]:
 
 # ── Rendering ──────────────────────────────────────────────────────────────────
 
-def render_overview(stats: dict, open_trades: list[dict] | None = None) -> str:
+def render_benchmark(agent_roic: float, index_ret: float | None) -> str:
+    """One-liner benchmark comparison block."""
+    agent_str = _pct(agent_roic)
+    if index_ret is None:
+        idx_str   = "  n/a (no data)"
+        alpha_str = ""
+        verdict   = ""
+    else:
+        idx_str   = _pct(index_ret)
+        alpha     = agent_roic - index_ret
+        alpha_str = f"   alpha: {_pct(alpha)}"
+        if alpha > 0.001:
+            verdict = "  BEAT index"
+        elif alpha < -0.001:
+            verdict = "  LAGGED index"
+        else:
+            verdict = "  MATCHED index"
+    return (f"  Agent return       : {agent_str}\n"
+            f"  Euro STOXX 50      : {idx_str}{alpha_str}{verdict}")
+
+
+def render_overview(stats: dict, open_trades: list[dict] | None = None,
+                    index_ret: float | None = None) -> str:
     if not stats:
-        return "  No completed trades in this period.\n"
+        idx_line = ""
+        if index_ret is not None:
+            idx_line = f"\n  Euro STOXX 50      : {_pct(index_ret)} (no trades to compare)"
+        open_line = f"\n  Currently open     : {len(open_trades)} position(s)" if open_trades else ""
+        return f"  No completed trades in this period.{idx_line}{open_line}\n"
 
     pf = (f"{stats['profit_factor']:.2f}"
           if stats['profit_factor'] != float("inf") else "inf (no losses)")
@@ -210,6 +279,8 @@ def render_overview(stats: dict, open_trades: list[dict] | None = None) -> str:
         f"  Commissions paid   : -{stats['total_commission']:.2f} EUR"
             f"   ({stats['total_commission'] / stats['n']:.2f} EUR avg/trade)",
         f"  Capital deployed   : {stats['total_invested']:,.0f} EUR total",
+        sep(),
+        render_benchmark(stats['roic'], index_ret),
         sep(),
         f"  Avg return/trade   : {_pct(stats['avg_return_pct'])} net"
             f"   ({_sign(stats['avg_pnl'])} EUR)",
@@ -349,11 +420,12 @@ def report_period(db: str, label: str, start: date, end: date,
     open_trades = get_open_trades(db) if show_open else None
     ticker_s    = by_ticker(trades)
     alert_s     = by_alert(trades)
+    index_ret   = _fetch_index_return(start, end)
 
     sections = [header(label)]
 
     sections.append("\n  OVERVIEW\n" + sep())
-    sections.append(render_overview(stats, open_trades))
+    sections.append(render_overview(stats, open_trades, index_ret))
 
     if show_open and open_trades:
         sections.append("\n  OPEN POSITIONS\n" + sep())
