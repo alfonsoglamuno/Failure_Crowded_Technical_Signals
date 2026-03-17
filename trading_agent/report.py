@@ -2,7 +2,7 @@
 Trading report — daily, weekly, monthly performance summaries.
 
 All P&L figures are NET of commissions.
-Return % is always relative to capital actually deployed (entry_price × quantity).
+Return % is always relative to capital actually deployed (entry_price x quantity).
 Each period shows benchmark comparison vs Euro STOXX 50 index (^STOXX50E).
 
 Usage:
@@ -101,7 +101,7 @@ def header(title: str) -> str:
 # ── Capital deployed per trade ─────────────────────────────────────────────────
 
 def _invested(t: dict) -> float:
-    """Capital deployed = entry_price × quantity (gross position size)."""
+    """Capital deployed = entry_price x quantity (gross position size)."""
     ep = t.get("entry_price") or 0
     qty = t.get("quantity") or 0
     return ep * qty

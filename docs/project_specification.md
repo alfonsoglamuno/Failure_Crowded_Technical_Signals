@@ -181,7 +181,7 @@ From smoke test on 3 tickers (2018-2024), h=3: ~46% failure rate. Expect similar
 |-----------------------|-----------------------------------------------|
 | `vol_zscore_5d`       | Volume z-score vs. 5-day window               |
 | `vol_zscore_20d`      | Volume z-score vs. 20-day window              |
-| `ret_vol_interaction` | |return| × volume z-score (attention proxy)   |
+| `ret_vol_interaction` | |return| x volume z-score (attention proxy)   |
 | `consec_up`           | Consecutive up sessions before alert          |
 | `consec_down`         | Consecutive down sessions before alert        |
 

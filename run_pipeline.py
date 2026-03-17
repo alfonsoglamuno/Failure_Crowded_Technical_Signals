@@ -165,7 +165,7 @@ def build_model_df(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
 
 merged, feat_cols = build_model_df(labeled)
 merged = merged.reset_index(drop=True)   # guarantee unique 0..N-1 index for proba mapping
-log.info("Feature matrix: %d rows × %d features", len(merged), len(feat_cols))
+log.info("Feature matrix: %d rows x %d features", len(merged), len(feat_cols))
 
 # ── Step 7: Model training ────────────────────────────────────────────────────
 log.info("=== Step 7: Walk-forward training ===")

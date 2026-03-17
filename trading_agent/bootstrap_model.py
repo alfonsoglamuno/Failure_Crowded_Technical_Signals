@@ -428,7 +428,7 @@ if __name__ == "__main__":
         description="Bootstrap XGBoost models for the trading agent",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Variants trained (horizon × direction mode):
+Variants trained (horizon x direction mode):
   h1d_longonly  h3d_longonly*  h5d_longonly
   h1d_both      h3d_both       h5d_both
 

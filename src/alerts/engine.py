@@ -140,7 +140,7 @@ def alert_gap_down(open_: pd.Series, close: pd.Series, threshold: float = 0.01) 
 def alert_atr_spike(
     high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14, multiplier: float = 2.0
 ) -> pd.Series:
-    """Daily ATR exceeds multiplier × rolling mean ATR."""
+    """Daily ATR exceeds multiplier x rolling mean ATR."""
     atr = _atr(high, low, close, window)
     return atr > multiplier * atr.rolling(window).mean().shift(1)
 

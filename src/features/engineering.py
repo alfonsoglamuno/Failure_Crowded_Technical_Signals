@@ -60,7 +60,7 @@ def add_volatility_features(df: pd.DataFrame, windows: list[int]) -> pd.DataFram
     df["gap_size"] = (df["open"] / df["close"].shift(1) - 1).abs()
 
     # Commission-awareness: how many round-trips of commission fit inside one ATR.
-    # IBKR round-trip ≈ 0.10% (2 × 0.05%). High ratio = stock moves dominate cost.
+    # IBKR round-trip ≈ 0.10% (2 x 0.05%). High ratio = stock moves dominate cost.
     # Model uses this to avoid illiquid/tight stocks where commission eats moves.
     _COMMISSION_RT = 0.001   # 0.10% round-trip (entry + exit, 0.05% each side)
     df["atr_vs_commission"] = df["atr_norm_14"] / _COMMISSION_RT
@@ -319,7 +319,7 @@ def add_momentum_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def add_peer_correlation_feature(result: pd.DataFrame, window: int = 20) -> pd.DataFrame:
     """
-    For each ticker × date, compute the average pairwise rolling return
+    For each ticker x date, compute the average pairwise rolling return
     correlation with all other tickers in the universe.
 
     avg_peer_corr_20d:
@@ -330,7 +330,7 @@ def add_peer_correlation_feature(result: pd.DataFrame, window: int = 20) -> pd.D
 
     This is a post-loop step because it requires all tickers simultaneously.
     """
-    # Pivot into a wide returns matrix (date × ticker)
+    # Pivot into a wide returns matrix (date x ticker)
     df = result.copy()
     df["_ret"] = df.groupby("ticker")["close"].pct_change()
     ret_wide = df.pivot_table(index="date", columns="ticker", values="_ret")
@@ -352,7 +352,7 @@ def add_peer_correlation_feature(result: pd.DataFrame, window: int = 20) -> pd.D
         )
         corr_cols[t] = peer_corrs.mean(axis=1)
 
-    avg_corr_wide = pd.DataFrame(corr_cols)   # date × ticker
+    avg_corr_wide = pd.DataFrame(corr_cols)   # date x ticker
     avg_corr_melted = (
         avg_corr_wide.reset_index()
         .melt(id_vars="date", var_name="ticker", value_name="avg_peer_corr_20d")

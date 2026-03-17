@@ -1,20 +1,22 @@
-# Predicting the Failure of Crowded Technical Signals for Short-Term Equity Reversals
+# Predicting the Failure of Crowded Technical Signals
 
-## Overview
+## Core Question
 
-A machine learning framework to predict the short-term **failure** of popular technical alerts in the **EURO STOXX 50** universe. Rather than treating indicators as direct trade signals, this project models them as observable events whose reliability depends on surrounding market conditions.
+> Given a visible chart alert (breakout, RSI extreme, MACD cross, abnormal volume) on a EURO STOXX 50 stock — and the surrounding market context — what is the probability that this alert will **fail to follow through** over the next 1–5 sessions?
 
-**Core question:** Given a visible chart alert (breakout, RSI extreme, MACD cross, abnormal volume), and the current market context — what is the probability that this alert will *fade* rather than follow through over the next 1-5 sessions?
+The model does not predict price direction. It predicts **signal reliability conditioned on context**. A bearish signal that fires into a high-correlation, high-momentum, high-volume environment has very different failure odds than the same signal in an idiosyncratic, low-crowding environment.
+
+**Tradeable consequence**: when the model assigns high probability of failure to a bearish alert, we enter a contrarian long (FADE → BUY). When a bullish alert is predicted to fail, we enter a contrarian short (FADE → SELL, requires `allow_short=true`).
 
 ---
 
 ## Hypothesis
 
-Technical alerts are not uniformly informative. Their short-term reliability depends on context. Highly visible signals occurring under crowded, attention-heavy, or exhausted market conditions are systematically more likely to fail and revert.
+Technical alerts are not uniformly informative. Their reliability depends on context.
 
-The framing is not: *"Will this stock go up in 5 minutes?"*
+Signals occurring under **crowded, attention-heavy, or exhausted** conditions are systematically more likely to fail and revert. This is consistent with the investor attention literature (Barber & Odean, 2008): when many participants act on the same visible signal, the trade is already priced in before it triggers, and the move fades.
 
-The framing is: *"Conditional on current liquidity, order-flow pressure, market regime, and relative move versus index/sector — is this move likely to continue or mean-revert enough to overcome costs?"*
+The project operationalises this as a classification problem: train a model to predict, for each alert event, whether it belongs to the "failure" class based on measurable context features.
 
 ---
 
@@ -22,247 +24,182 @@ The framing is: *"Conditional on current liquidity, order-flow pressure, market 
 
 ```
 .
-├── configs/                  # Configuration files
+├── configs/                  # Universe tickers, shared config
 ├── data/                     # Data storage (gitignored)
-├── notebooks/                # Exploratory and reporting notebooks
-├── src/                      # Core source code
-│   ├── data/                 # Data download and preprocessing
-│   ├── alerts/               # Alert detection engine (18 signal types)
-│   ├── features/             # Feature engineering (74 features, 8 blocks)
+├── reports/                  # Model evaluation scripts and saved results
+│   ├── evaluate_models.py    ← Run to evaluate all trained variants
+│   └── results/              ← CSV outputs from evaluation runs
+├── notebooks/                # Exploratory analysis
+├── src/                      # Core research pipeline
+│   ├── data/                 # Download and panel construction
+│   ├── alerts/               # 18 technical signal detectors
+│   ├── features/             # Feature engineering (80+ features, 9 blocks)
 │   ├── models/               # Training, evaluation, calibration
 │   └── backtest/             # Strategy simulation
-├── trading_agent/            # Live trading agent (IBKR)
-│   └── README.md             ← agent-specific documentation
-├── tests/
-├── requirements.txt
-└── README.md
+└── trading_agent/            # Live IBKR agent (see trading_agent/README.md)
 ```
 
 ---
 
-## Alert Families
+## Alert Families (18 signal types)
 
-| Family | Alerts |
-|--------|--------|
-| **Trend** | N-day high/low breakout, MA crossovers |
-| **Momentum** | RSI overbought/oversold, MACD cross, Stochastic reversal |
-| **Volatility** | Bollinger-band breakout, ATR spike, large candle |
-| **Volume / Attention** | Abnormal volume spike, gap moves, extreme 1-day returns |
+| Family | Signals |
+|--------|---------|
+| Trend | N-day high/low breakout, MA crossovers |
+| Momentum | RSI overbought/oversold, MACD cross, Stochastic reversal |
+| Volatility | Bollinger-band breakout, ATR spike, large candle |
+| Volume / Attention | Abnormal volume spike, gap moves, extreme 1-day return |
+
+Each alert fires with a direction (bullish / bearish / neutral). The model learns separately for each combination of alert type, direction, and context.
 
 ---
 
 ## Label Design
 
 For each alert event on day `t`:
-- **Bullish alert failure**: forward return `r(t+1 : t+h) < -θ`
-- **Bearish alert failure**: forward return `r(t+1 : t+h) > +θ`
 
-Where `h ∈ {1, 3, 5}` days and `θ = 0.5%` minimum economically meaningful return.
-Six model variants (see Model Variants section) cover all horizon × direction combinations.
+- **Bearish alert failure**: forward return over `[t+1, t+h]` > +θ (expected move did not happen — price went up)
+- **Bullish alert failure**: forward return over `[t+1, t+h]` < −θ (expected continuation did not happen)
 
----
+Where `h ∈ {1, 3, 5}` days and `θ = 0.5%` (minimum economically meaningful move after costs).
 
-## Feature Design Philosophy
-
-This project follows a **tiered feature architecture** derived from intraday market microstructure research:
-
-> "For intraday trading, the most useful features are microstructure, liquidity, and market-state features — not just classic daily-chart indicators."
-
-### Tier 1 — Feasible now (daily OHLCV + market data)
-
-These are computable from standard OHLCV bars and index data:
-
-| Feature group | Examples | Block |
-|---------------|----------|-------|
-| Short-term price state | 1m/5m/15m returns proxy (daily lag returns), MA distance | B |
-| Volatility state | Realized vol, ATR, candle range, gap size | C |
-| Commission awareness | ATR vs round-trip cost — is the trade worth entering? | C |
-| Volume / attention | Volume z-score, consec up/down, vol × return interaction | D |
-| Market regime | Index trend, beta, correlation, relative strength | E |
-| Calendar / session | Day-of-week, month-end, week-start/end (session regime) | F |
-| Intraday structure | Close-vs-range, open-to-close direction, VWAP distance, gap fill | H |
-| Peer correlation | Average 20d pairwise correlation with all EURO STOXX 50 peers | G |
-
-### Tier 2 — Best if L2/tick data is available
-
-These would be added if IBKR or a data vendor provides intraday bars or order-book snapshots:
-
-| Feature | Why it matters |
-|---------|---------------|
-| Order-book imbalance (bid vs ask qty) | Strongest intraday predictor; real-time supply/demand balance |
-| Aggressor-side volume ratio | Buy-initiated vs sell-initiated volume signals order flow |
-| Cancel-to-add ratio | Rising cancellations = liquidity deterioration before a move |
-| 1-min / 5-min / 15-min returns | True short-horizon momentum; much more predictive than daily |
-| True intraday VWAP | Computed from 1-min (V×P) / cumulative V — institutional benchmark |
-| Volume vs same-minute-of-day | True "relative volume now vs typical" baseline for intraday |
-| Opening-range breakout / failure | First 30-min high-low: critical session-structure feature |
-| Small-order intensity | Retail attention proxy without needing search/news data |
+Six model variants cover all horizon x direction combinations (see below).
 
 ---
 
-## Feature Blocks (74 features)
+## Feature Blocks (9 blocks, 80+ features)
+
+All features use only information available at end of day T. No forward-looking data.
+See the leakage note at the end of this section.
 
 ### Block A — Alert properties
 `direction_*`, `alert_name_*`, `n_simultaneous_alerts`
 
-Alert type, direction (bullish/bearish/neutral), and simultaneous alert count.
-Multiple concurrent signals amplify crowding: more screens fire → more retail attention → higher fade probability (Barber & Odean, 2008).
+Alert type and direction are the primary inputs. Multiple concurrent alerts on the same ticker amplify the crowding signal (Barber & Odean, 2008).
 
 ### Block B — Short-term price state
 `ret_1d/3d/5d/10d/20d`, `dist_ma10/20/50/100/200`, `price_pos_20d`
 
-How overextended is the stock? MA distance and momentum quantify "crowdedness." A stock far above its 50d MA after a volume surge is a classic crowded long.
+Distance from moving averages and recent momentum quantify overextension. A stock far above its 50d MA after a volume surge is the archetypal crowded long.
 
-### Block C — Volatility and cost awareness
+### Block C — Volatility and cost
 `realvol_5d/10d/20d`, `atr_14`, `atr_norm_14`, `candle_range_norm`, `gap_size`, `atr_vs_commission`, `vol_regime_pct`
 
-- `atr_vs_commission` = ATR / round-trip commission cost (0.10%). When the stock barely moves relative to what the trade costs, the model should skip it.
-- `vol_regime_pct` = volatility percentile over 60 sessions. High vol regimes change fade reliability dramatically.
+`atr_vs_commission`: ATR / round-trip cost (0.10%). The model learns to avoid tight, low-move stocks where commission consumes the entire predicted edge. `vol_regime_pct` captures whether the current volatility environment is historically elevated or compressed.
 
-### Block D — Volume and attention state
+### Block D — Volume and attention
 `vol_zscore_5d/20d`, `ret_vol_interaction`, `consec_up/down`
 
-- `ret_vol_interaction` = |return| × volume z-score. The crowding intensity signal: a large move on elevated volume is exactly the retail-attention scenario.
-- `consec_up/down` = streak of consecutive positive/negative days. Streaks attract attention and are prone to reversal.
+`ret_vol_interaction` = |return| x volume z-score: the crowding intensity signal. Consecutive up/down streaks attract retail attention and are historically prone to reversal.
 
 ### Block E — Market regime (EURO STOXX 50)
-`index_ret_1d/5d/20d`, `index_vol_20d`, `index_above_ma50/200`,
-`index_corr_20d/60d`, `beta_20d/60d`, `rel_strength_1d/5d/20d`, `index_regime`
+`index_ret_1d/5d/20d`, `index_vol_20d`, `index_above_ma50/200`, `index_corr_20d/60d`, `beta_20d/60d`, `rel_strength_1d/5d/20d`, `index_regime`
 
-Market regime is the single most important context variable:
-- `index_above_ma200` — bear vs bull market. Fade signals are more reliable in bear markets where retail "buy the dip" fails more consistently.
-- `index_regime` — +1 bull / 0 neutral / -1 bear (20d return threshold ±2%)
-- `rel_strength_1d` — 1-day stock return minus index return. An idiosyncratic move is more likely to mean-revert; a move that just follows the tape may continue.
-- `beta_20d/60d` — high-beta stocks amplify index moves; low-beta behave more independently. The model uses this to determine whether a signal is regime-driven or stock-specific.
+Market regime is the single strongest context variable. `index_above_ma200` distinguishes bear and bull markets; fade signals are more reliable in bear markets where retail "buy the dip" fails consistently. `rel_strength_1d` separates idiosyncratic moves (more likely to revert) from moves that just follow the index.
 
-### Block F — Calendar and session timing
+### Block F — Calendar and session
 `dow`, `month`, `is_month_end/start`, `is_week_start/end`
 
-Intraday behavior is not stationary. Monday openings, Friday squaring, month-end rebalancing, and sector rotation events create predictable flow patterns. These are mandatory for any intraday model.
+Intraday and session-level trading behaviour is not stationary. Monday repositioning, Friday squaring, and month-end rebalancing create systematic flow patterns.
 
 ### Block G — Inter-stock peer correlation
 `avg_peer_corr_20d`
 
-Average 20-day pairwise return correlation with all other EURO STOXX 50 stocks.
-- High value → stocks are moving together (herding/risk-on-off regime)
-- Low value → idiosyncratic trading → signal is stock-specific and cleaner
-
-This is the cross-sectional crowding feature: when everything is correlated, any individual signal has more systematic noise in it.
+Average 20-day pairwise correlation with all other EURO STOXX 50 stocks. When everything is correlated (herding regime), individual signals carry more systematic noise and fewer stock-specific information. The model discounts signals in high-herding environments.
 
 ### Block H — Intraday structure proxies (daily OHLCV)
 `close_vs_range`, `open_to_close_ret`, `gap_pct`, `gap_is_filled`, `vwap_distance`, `vol_vs_dow_baseline`, `reversal_intrabar`
 
-These approximate microstructure signals without L2 data:
+Closest approximations to microstructure signals without L2/tick data. `close_vs_range` = 0 means sellers dominated the session; 1 means buyers dominated. A bearish alert that closed near the daily high suggests residual buying — the fade signal is weaker.
 
-| Feature | Microstructure meaning |
-|---------|----------------------|
-| `close_vs_range` | 0=closed at low (sellers won), 1=closed at high (buyers won) |
-| `open_to_close_ret` | Signed intraday order-flow direction |
-| `gap_pct` | Overnight gap — informed flow or retail panic? |
-| `gap_is_filled` | Did price trade back through the gap? Strong reversal confirmation |
-| `vwap_distance` | Close vs (H+L+2C)/4 — standard institutional VWAP proxy |
-| `vol_vs_dow_baseline` | Volume vs 8-week same-day-of-week rolling mean (session-normalized) |
-| `reversal_intrabar` | Gap-down recovery fraction — buying absorption proxy |
+### Block I — Trend and momentum (recency)
+`ema_slope_5d/20d`, `rsi_14`, `rsi_trend_5d`, `macd_hist_norm`, `vol_accel`
 
-**Important note on leakage:** All Block H features use only information available at the daily close (or during the day for same-day decisions). VWAP and range use only that day's OHLCV, not end-of-day session totals. Always ensure the bar is closed before using these features at any horizon.
+Direction and rate-of-change of price dynamics, not just levels. A bearish alert into a falling RSI and negative MACD is more reliable than one into a rising RSI. `vol_accel` (short vol / long vol) flags regime transitions. Based on Jegadeesh & Titman (1993) and Lo & MacKinlay (1988).
+
+### Leakage note
+
+All features use only data available at the close of day T. Forward-looking columns (`ret_1d_lead`, `fwd_ret_{h}d`) are explicitly excluded from the training matrix. A full leakage audit found no contamination across all 9 blocks (see `reports/leakage_audit.md`).
 
 ---
 
 ## Model Variants
 
-Six models are trained across two axes:
+Six models across two axes:
 
-| Axis | Values | Meaning |
-|------|--------|---------|
-| **Horizon** | 1d, 3d, 5d | Forward return window for labels |
-| **Mode** | `longonly`, `both` | Which alert directions are included |
+| Variant | Horizon | Direction | Primary use case |
+|---------|---------|-----------|-----------------|
+| **`h1d_longonly`** | 1 day | Long-only | **Default** — intraday fades, EOD close, no shorts |
+| `h3d_longonly` | 3 days | Long-only | Swing fades, 3-day holds, no shorts |
+| `h5d_longonly` | 5 days | Long-only | Multi-day positions, no shorts |
+| `h1d_both` | 1 day | Long + Short | Intraday, requires `allow_short=true` |
+| `h3d_both` | 3 days | Long + Short | Swing, requires `allow_short=true` |
+| `h5d_both` | 5 days | Long + Short | Position, requires `allow_short=true` |
 
-```
-h1d_longonly  h3d_longonly*  h5d_longonly
-h1d_both      h3d_both       h5d_both
-```
-`*` = default active variant
+**`longonly`**: trains only on bearish/neutral alert events — optimised for FADE→BUY entries. Better calibrated for a long-only book because training examples exactly match the trades executed.
 
-**`longonly`**: trains only on bearish/neutral alert events — optimised for FADE→BUY entries.
-Produces a better-calibrated model for a long-only book because training examples match the actual trades taken.
+**`both`**: trains on all alert directions. Required when `allow_short=true` because the model must also score bullish-alert failure (FADE→SELL). Has more training data but is noisier for long-only decisions.
 
-**`both`**: trains on all events including bullish alerts. Required when `allow_short=true`
-because the model must also score SELL-side signal failures. Has more training data but
-is noisier for long-only decisions.
+**Default is `h1d_longonly`** — intraday holds, EOD close, no short-selling risk. This is the safest starting point and the model most aligned to what is actually traded.
 
-**Choosing a variant:**
-- Conservative paper trading → `h3d_longonly` (default)
-- Shorter holds / intraday → `h1d_longonly`
-- Longer multi-day holds → `h5d_longonly` or `h5d_both`
-- Full long/short book → `h3d_both` or `h5d_both`
+### Correlation treatment by mode
+
+In **longonly** mode, all positions are longs. High correlation between two open positions means doubled same-direction exposure → blocked at 0.85 for h1d, 0.70 for h3d, 0.65 for h5d.
+
+In **both** mode, a LONG on stock A and SHORT on stock B that are highly correlated is actually a **hedged pair**: when A rises, B also rises (bad for the short), so the two P&Ls partially cancel. The correlation gate is direction-adjusted: `effective_corr = sign(candidate) x sign(open) x raw_corr`. Only same-direction concentrated bets are blocked.
 
 ---
 
 ## Validation Framework
 
-- Strict **chronological** train / validation / test splits (no shuffling)
-- **Walk-forward** evaluation (rolling or expanding window)
-- **Purging and embargo** to prevent label overlap leakage between adjacent events
-- All features use only **past information** relative to the prediction timestamp
-- Separate validation for each horizon × mode variant
+- Strict **chronological** train/validation splits (no data shuffling)
+- Walk-forward evaluation to test regime generalization
+- Purging and embargo around adjacent events to prevent label-window leakage
+- All features computed with information available at end of day T only
+- Separate validation per horizon x mode variant
+
+### Running evaluation
+
+```bash
+# Evaluate all variants (outputs to reports/results/)
+python reports/evaluate_models.py
+
+# One variant
+python reports/evaluate_models.py --variant h1d_longonly
+
+# Save to specific path
+python reports/evaluate_models.py --output reports/results/my_run.csv
+```
+
+The script measures AUC, precision and recall at multiple thresholds, break-even analysis, and calibration error. Results accumulate in `reports/results/` as a historical record.
 
 ---
 
-## Key Design Decisions and Warnings
-
-### Leakage is the biggest trap for intraday models
-
-Common sources of lookahead in intraday feature engineering:
-- Using today's high/low before the bar has closed
-- Normalizing today's volume by end-of-day total (not available intraday)
-- Using the full-session VWAP when predicting mid-session
-- Regime features that depend on closing values used for intraday entry
-
-This project uses daily bars and predicts at end-of-day, which avoids intraday leakage.
-If moving to 1-min or 5-min bars, audit every feature for look-ahead with respect to
-the prediction timestamp.
+## Key Design Decisions
 
 ### Execution cost frames the strategy
 
-A signal is only valuable if it survives execution:
-- Spread and market impact absorb small predicted edges
-- Commission must be recoverable within the predicted move
-- The `atr_vs_commission` feature explicitly models this trade-off
+A signal is only worth trading if the predicted edge survives execution. With a 2,000 EUR position:
+- IBKR commission: ~2.00 EUR per side (0.05% x 2,000, min 2 EUR)
+- Round-trip cost: ~4 EUR on a 2,000 EUR position = 0.20%
+- SL = 1.5%, TP = 2.5% → break-even precision ≈ 40%
 
-The `risk.py` guard (`expected_gross < 2 × commission`) enforces it at the trade level.
+The `atr_vs_commission` feature and the `expected_gross < 2 x commission` guard in `risk.py` enforce this at the trade level.
 
-### Attention spikes are double-edged
+### Attention signals are double-edged
 
-Volume and news spikes can mean:
-- Crowd exhaustion → fade opportunity, OR
-- Real information → continuation
+A volume spike can mean crowd exhaustion (fade opportunity) or real information arrival (continuation). The model distinguishes these by combining attention features (`vol_zscore`, `n_simultaneous_alerts`) with regime context (`index_regime`, `index_above_ma200`) and relative move (`rel_strength_1d`). Volume alone is insufficient.
 
-The model combines attention (`vol_zscore`, `n_simultaneous_alerts`) with market regime
-(`index_regime`, `index_above_ma200`) and relative move (`rel_strength_1d`) to
-distinguish these cases. Volume alone is insufficient.
+### Correlation is context-dependent
 
-### Correlation is unstable intraday
+Cross-stock correlation changes meaning depending on hold duration and direction mode:
+- Intraday (h1d): positions close EOD regardless — overlap risk is minimal. Softer gate (0.85).
+- Swing/position (h3d/h5d): positions can overlap for multiple days. Tighter gate (0.70 / 0.65).
+- Short-enabled (both): direction-adjusted. Correlated long+short pairs are partially hedged.
 
-Cross-stock correlation (`avg_peer_corr_20d`) is used as a context feature and a
-portfolio-level gate (skip new trades that are >0.70 correlated with open positions).
-However, intraday correlation strengthens near the close — use shorter windows for
-intraday decisions and treat correlation as a risk-control input, not standalone alpha.
+### Recency matters in training
 
----
-
-## Performance (Current Models)
-
-| Variant | AUC | Precision@0.60 | Precision@0.70 |
-|---------|-----|----------------|----------------|
-| h1d_longonly | 0.766 | 78.2% | 83.0% |
-| h3d_longonly | 0.760 | 75.0% | 83.4% |
-| h5d_longonly | 0.758 | — | — |
-| h1d_both | 0.672 | 70.4% | 80.0% |
-| h3d_both | 0.696 | 70.5% | 81.6% |
-| h5d_both | 0.717 | 79.5% | 89.3% |
-
-Break-even hit rate with 2,000 EUR position at IBKR: ~37.5%.
-Active variant (h3d_longonly) delivers **75.0%** at threshold 0.60.
+Market microstructure and crowding behaviour shift over time. Training weights decay exponentially with a 252-day half-life (1 trading year), so recent data has more influence. The model retrains monthly, plus an early-trigger if live hit-rate drops more than 10pp from baseline.
 
 ---
 
@@ -270,7 +207,8 @@ Active variant (h3d_longonly) delivers **75.0%** at threshold 0.60.
 
 - Barber, B. M., & Odean, T. (2008). *All That Glitters: The Effect of Attention and News on the Buying Behavior of Individual and Institutional Investors.* Review of Financial Studies.
 - Lopez de Prado, M. (2018). *Advances in Financial Machine Learning.* Wiley.
+- Jegadeesh, N., & Titman, S. (1993). *Returns to Buying Winners and Selling Losers.* Journal of Finance.
+- Lo, A. W., & MacKinlay, A. C. (1988). *Stock Market Prices Do Not Follow Random Walks.* Review of Financial Studies.
 - Cont, R. (2001). *Empirical properties of asset returns: stylized facts and statistical issues.* Quantitative Finance.
-- Gould, M. D., et al. (2013). *Limit Order Books.* Quantitative Finance.
-- Cartea, Á., Jaimungal, S., & Penalva, J. (2015). *Algorithmic and High-Frequency Trading.* Cambridge University Press.
+- Cartea, A., Jaimungal, S., & Penalva, J. (2015). *Algorithmic and High-Frequency Trading.* Cambridge University Press.
 - Andersen, T. G., & Bollerslev, T. (1998). *Answering the Critics: Yes, ARCH Models Do Provide Good Volatility Forecasts.* International Economic Review.

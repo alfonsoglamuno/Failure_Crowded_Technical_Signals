@@ -8,10 +8,10 @@ Usage:
     python run_agent.py --status                     # print journal summary, no trading
     python run_agent.py --paper --once               # run one cycle now
 
-Model variants (horizon × direction mode):
+Model variants (horizon x direction mode):
     h1d_longonly   1-day hold, BUY-only (fastest intraday fades)
     h3d_longonly   3-day hold, BUY-only  ← default
-    h5d_longonly   5-day hold, BUY-only
+    h5d_longonly   5-day hold, BUY-only  — multi-day positions
     h1d_both       1-day hold, BUY+SELL  (allow_short=true required)
     h3d_both       3-day hold, BUY+SELL
     h5d_both       5-day hold, BUY+SELL
@@ -55,51 +55,94 @@ _MARKET_CLOSE = dtime(17, 0)
 # GBP-denominated tickers — skip for EUR sizing (exchange rate not applied)
 _GBP_TICKERS = {"CRH.L", "FLTR.L", "NG.L"}
 
-_PEER_CORR_THRESHOLD = 0.70   # skip candidate if corr with any open position exceeds this
+# Horizon-dependent correlation thresholds.
+# Intraday (h1d): positions close EOD — overlap risk is low, gate is soft.
+# Swing/position (h3d, h5d): positions can overlap for days — gate is tighter.
+_PEER_CORR_THRESHOLD = {1: 0.85, 3: 0.70, 5: 0.65}
 _PEER_CORR_WINDOW    = 20     # trading days for correlation lookback
 
 
-def _max_corr_with_open(candidate: str, open_tickers: set[str],
-                         universe_data: dict) -> float:
-    """
-    Return the maximum 20-day return correlation between `candidate` and any
-    currently-open position. Used to avoid concentrating correlated exposure.
+def _corr_threshold(horizon_days: int) -> float:
+    """Return correlation gate threshold for a given hold horizon."""
+    return _PEER_CORR_THRESHOLD.get(horizon_days, 0.70)
 
-    Returns 0.0 if open_tickers is empty or data is insufficient.
+
+def _parse_horizon(variant: str) -> int:
+    """Extract hold horizon in days from variant name (e.g. 'h3d_longonly' -> 3)."""
+    try:
+        return int(variant.split("d_")[0].lstrip("h"))
+    except Exception:
+        return 3
+
+
+def _max_corr_with_open(candidate: str,
+                         candidate_direction: str,
+                         open_positions: dict[str, str],
+                         universe_data: dict,
+                         allow_short: bool = False) -> float:
     """
-    if not open_tickers or candidate not in universe_data:
+    Return the maximum *effective* 20-day return correlation between `candidate`
+    and any currently-open position.
+
+    Long-only mode (allow_short=False):
+      All positions are longs, candidate is long. Raw |correlation| is used.
+      High raw corr = concentrated same-direction bet = block.
+
+    Short-enabled mode (allow_short=True):
+      Direction-adjusted effective correlation:
+        effective_corr = sign(candidate) * sign(open) * raw_corr
+      - Same direction + high raw corr  -> effective_corr > 0 (concentrated) -> block
+      - Opposite directions + high corr -> effective_corr < 0 (hedged pair)  -> allow
+
+      Rationale: LONG A and SHORT B on correlated stocks partially delta-hedge each
+      other. Blocking this pair would prevent pairs-trade-style entries. The gate
+      should only block same-direction concentration.
+
+    Returns 0.0 if open_positions is empty or data is insufficient.
+    """
+    if not open_positions or candidate not in universe_data:
         return 0.0
 
     import pandas as pd
+    import math
     cand_df = universe_data[candidate]
     if "close" not in cand_df.columns or len(cand_df) < _PEER_CORR_WINDOW + 2:
         return 0.0
 
-    cand_ret = cand_df["close"].pct_change().dropna().tail(_PEER_CORR_WINDOW * 2)
-    max_corr = 0.0
+    cand_ret  = cand_df["close"].pct_change().dropna().tail(_PEER_CORR_WINDOW * 2)
+    cand_sign = 1 if candidate_direction == "BUY" else -1
+    max_eff   = 0.0
 
-    for open_t in open_tickers:
+    for open_t, open_dir in open_positions.items():
         if open_t not in universe_data:
             continue
         peer_df = universe_data[open_t]
         if "close" not in peer_df.columns or len(peer_df) < _PEER_CORR_WINDOW + 2:
             continue
         peer_ret = peer_df["close"].pct_change().dropna().tail(_PEER_CORR_WINDOW * 2)
-        aligned = pd.concat([cand_ret, peer_ret], axis=1, join="inner")
+        aligned  = pd.concat([cand_ret, peer_ret], axis=1, join="inner")
         if len(aligned) < _PEER_CORR_WINDOW:
             continue
-        corr = float(aligned.iloc[:, 0].corr(aligned.iloc[:, 1]))
-        if not __import__("math").isnan(corr):
-            max_corr = max(max_corr, abs(corr))
+        raw_corr = float(aligned.iloc[:, 0].corr(aligned.iloc[:, 1]))
+        if math.isnan(raw_corr):
+            continue
 
-    return max_corr
+        if allow_short:
+            open_sign    = 1 if open_dir == "BUY" else -1
+            effective    = cand_sign * open_sign * raw_corr
+        else:
+            effective    = abs(raw_corr)   # longonly: all same direction
+
+        max_eff = max(max_eff, effective)
+
+    return max_eff
 
 
 # ── Model variant helpers ─────────────────────────────────────────────────────
 
 _VARIANTS = [
-    ("h1d_longonly", "1-day hold, BUY-only  — fastest intraday fades"),
-    ("h3d_longonly", "3-day hold, BUY-only  — standard swing fades [default]"),
+    ("h1d_longonly", "1-day hold, BUY-only  — intraday fades, EOD close [default]"),
+    ("h3d_longonly", "3-day hold, BUY-only  — swing fades, no shorts"),
     ("h5d_longonly", "5-day hold, BUY-only  — multi-day positions"),
     ("h1d_both",     "1-day hold, BUY+SELL  — requires allow_short=true"),
     ("h3d_both",     "3-day hold, BUY+SELL  — requires allow_short=true"),
@@ -508,6 +551,23 @@ def run_once(paper: bool, cfg: dict):
         if already_traded_today:
             log.info("Already traded today: %s — will not re-enter", sorted(already_traded_today))
 
+        # Build direction map for open positions — used by the correlation gate.
+        # Knowing each position's direction (BUY/SELL) lets us distinguish hedged
+        # pairs (long+short on correlated names) from concentrated same-direction bets.
+        open_trades_all = journal.get_recent_trades(100)
+        open_positions_dir: dict[str, str] = {
+            t["ticker"]: t.get("trade_direction", "BUY")
+            for t in open_trades_all
+            if t.get("status") in ("submitted", "filled")
+            and t.get("exit_price") is None
+        }
+
+        # Horizon from active variant — drives correlation gate threshold.
+        _active_variant = cfg["model"].get("variant", "h3d_longonly")
+        _horizon_days   = _parse_horizon(_active_variant)
+        _corr_thr       = _corr_threshold(_horizon_days)
+        _allow_short    = cfg["strategy"].get("allow_short", False)
+
         # Build set of tickers already active in IBKR:
         #   - any non-zero positions (long OR short — shorts block new long entries)
         #   - pending/submitted orders (PendingSubmit, Submitted, PreSubmitted)
@@ -565,14 +625,20 @@ def run_once(paper: bool, cfg: dict):
                 log.info("Skipping %s — already holding long position", sig.ticker)
                 continue
 
-            # Correlation gate — avoid concentrating correlated positions.
-            # If the candidate is highly correlated (>0.70) with any open position,
-            # adding it is just leveraging the same factor — skip it.
-            max_corr = _max_corr_with_open(sig.ticker, open_ibkr_positions, universe_data)
-            if max_corr >= _PEER_CORR_THRESHOLD:
+            # Correlation gate — direction-aware, horizon-scaled.
+            # Longonly: block if raw |corr| > threshold (all positions same direction).
+            # Short-enabled: block only if effective_corr = sign(cand)*sign(open)*corr
+            # exceeds threshold — allows hedged long+short pairs on correlated stocks.
+            # Threshold is softer for h1d (0.85, EOD close) vs h3d (0.70) vs h5d (0.65).
+            max_corr = _max_corr_with_open(
+                sig.ticker, sig.trade_direction,
+                open_positions_dir, universe_data,
+                allow_short=_allow_short,
+            )
+            if max_corr >= _corr_thr:
                 log.info(
-                    "Skipping %s — max corr with open positions %.2f >= %.2f threshold",
-                    sig.ticker, max_corr, _PEER_CORR_THRESHOLD,
+                    "Skipping %s — effective corr %.2f >= %.2f threshold (h%dd, short=%s)",
+                    sig.ticker, max_corr, _corr_thr, _horizon_days, _allow_short,
                 )
                 continue
 

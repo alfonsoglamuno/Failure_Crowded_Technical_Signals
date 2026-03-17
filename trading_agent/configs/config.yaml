@@ -61,13 +61,15 @@ strategy:
 
 model:
   # Active model variant. Format: h{horizon}d_{mode}
-  #   horizon : 1d (intraday focus) | 3d (swing default) | 5d (position)
+  #   horizon : 1d (intraday, default) | 3d (swing) | 5d (multi-day position)
   #   mode    : longonly (BUY entries only) | both (BUY + SELL, requires allow_short=true)
-  # After running bootstrap_model.py, set this to choose which model the agent uses.
-  variant: "h3d_longonly"
+  #
+  # Default: h1d_longonly — intraday holds, long-only, EOD close.
+  # Use both mode ONLY after confirming IBKR short locates are available.
+  variant: "h1d_longonly"
   # Paths are derived from variant — change variant above, not paths below.
-  path: "data/model/xgboost_h3d_longonly.joblib"
-  feature_cols_path: "data/model/feature_cols_h3d_longonly.json"
+  path: "data/model/xgboost_h1d_longonly.joblib"
+  feature_cols_path: "data/model/feature_cols_h1d_longonly.json"
   min_history_days: 252
 
   # Learning loop — optimised for active paper trading (5 trades/day → fast feedback)
