@@ -28,6 +28,7 @@ from src.features.engineering import (
     add_intraday_structure_features,
     add_regime_features,
     add_peer_correlation_feature,
+    add_momentum_features,
     _align_index,
 )
 
@@ -52,6 +53,7 @@ def build_features_for_ticker(
     df = add_volume_features(df, [5, 20])
     df = add_calendar_features(df)
     df = add_intraday_structure_features(df)
+    df = add_momentum_features(df)   # Block I: ema_slope, rsi_14, macd_hist_norm, vol_accel
 
     if index_close is not None:
         df = add_regime_features(df, index_close)

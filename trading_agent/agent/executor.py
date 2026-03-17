@@ -20,12 +20,14 @@ class OrderResult:
     action: str               # FADE or FOLLOW
     trade_direction: str      # BUY or SELL
     quantity: float
-    entry_price: float
+    entry_price: float        # pre-order quote used for SL/TP sizing
     stop_loss: float
     take_profit: float
     parent_order_id: int
-    status: str               # submitted / error
+    status: str               # submitted / filled / error
     error_msg: str = ""
+    actual_fill_price: float = 0.0   # actual average fill price from IBKR (0 = not yet filled)
+    slippage_pct: float = 0.0        # (actual_fill - entry_price) / entry_price
 
 
 class IBKRExecutor:
@@ -171,17 +173,50 @@ class IBKRExecutor:
             parent_status = all_trades.get(parent_id)
             status_str = parent_status.orderStatus.status if parent_status else "Unknown"
 
-            log.info(
-                "[%s] Bracket placed: %s %s qty=%d entry=%.4f SL=%.4f TP=%.4f "
-                "orderId=%d status=%s",
-                "PAPER" if self.paper else "LIVE",
-                ib_action, yahoo_ticker, qty,
-                entry_price, stop_loss, take_profit,
-                parent_id, status_str,
-            )
-
             if status_str in ("Inactive", "ApiCancelled", "Cancelled"):
                 raise RuntimeError(f"Order rejected by IBKR — status: {status_str}")
+
+            # ── Poll for actual fill price (market orders typically fill within 1-2s) ──
+            # We wait up to 5 seconds to capture the actual average fill price.
+            # This matters because the SL/TP were anchored to entry_price (the quote),
+            # but the real cost basis is the fill price. We log slippage for every trade.
+            actual_fill = 0.0
+            slippage = 0.0
+            for _ in range(10):
+                self.ib.sleep(0.5)
+                pt = {t.order.orderId: t for t in self.ib.trades()}.get(parent_id)
+                if pt and pt.orderStatus.status == "Filled" and pt.fills:
+                    actual_fill = float(pt.fills[-1].execution.avgPrice)
+                    break
+
+            if actual_fill > 0 and entry_price > 0:
+                slippage = (actual_fill - entry_price) / entry_price
+                slippage_dir = "+" if slippage >= 0 else ""
+                log.info(
+                    "[%s] Fill confirmed: %s %s qty=%d  quote=%.4f  fill=%.4f  "
+                    "slippage=%s%.4f%%  SL=%.4f  TP=%.4f  orderId=%d",
+                    "PAPER" if self.paper else "LIVE",
+                    ib_action, yahoo_ticker, qty,
+                    entry_price, actual_fill,
+                    slippage_dir, slippage * 100,
+                    stop_loss, take_profit, parent_id,
+                )
+                if abs(slippage) > 0.001:   # > 0.10% — warn and note for re-anchor
+                    log.warning(
+                        "[SLIPPAGE] %s fill slippage %.4f%% exceeds 0.10%% — "
+                        "SL/TP anchored to quote (%.4f), actual cost basis is %.4f",
+                        yahoo_ticker, slippage * 100, entry_price, actual_fill,
+                    )
+            else:
+                # Order submitted but not yet filled (e.g., pre-open session)
+                status_str = "submitted"
+                log.info(
+                    "[%s] Bracket submitted (fill pending): %s %s qty=%d "
+                    "quote=%.4f SL=%.4f TP=%.4f orderId=%d",
+                    "PAPER" if self.paper else "LIVE",
+                    ib_action, yahoo_ticker, qty,
+                    entry_price, stop_loss, take_profit, parent_id,
+                )
 
             return OrderResult(
                 yahoo_ticker=yahoo_ticker,
@@ -193,7 +228,9 @@ class IBKRExecutor:
                 stop_loss=stop_loss,
                 take_profit=take_profit,
                 parent_order_id=parent_id,
-                status="submitted",
+                status="filled" if actual_fill > 0 else "submitted",
+                actual_fill_price=actual_fill,
+                slippage_pct=slippage,
             )
 
         except Exception as e:

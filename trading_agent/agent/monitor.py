@@ -63,7 +63,9 @@ class PositionMonitor:
                 continue
 
             exit_price  = exit_fill["price"]
-            entry_price = trade.get("entry_price", 0)
+            # Use actual fill price as cost basis if available (recorded by executor),
+            # otherwise fall back to the pre-order quote.
+            entry_price = trade.get("fill_price") or trade.get("entry_price", 0)
             quantity    = trade.get("quantity", 0)
             direction   = trade.get("trade_direction", "BUY")
 
@@ -257,7 +259,8 @@ class PositionMonitor:
 
         # Record ESTIMATED exit — marked pending_close so check_exits can
         # override it with the real fill price on the next monitor cycle.
-        entry_px  = rec.get("entry_price", current_px)
+        # Use actual fill price as cost basis when available.
+        entry_px  = rec.get("fill_price") or rec.get("entry_price", current_px)
         pnl_gross = ((current_px - entry_px) * qty if direction == "BUY"
                      else (entry_px - current_px) * qty)
         trade_value = entry_px * qty

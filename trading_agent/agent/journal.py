@@ -81,6 +81,13 @@ class Journal:
                     conn.execute(f"ALTER TABLE signals ADD COLUMN {col} {typedef}")
                 except Exception:
                     pass  # column already exists
+            for col, typedef in [
+                ("slippage_pct", "REAL"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {typedef}")
+                except Exception:
+                    pass
 
     def log_signal(
         self,
@@ -157,6 +164,26 @@ class Journal:
                  ibkr_order_id, status, int(paper)),
             )
             return cur.lastrowid
+
+    def update_entry_fill(
+        self,
+        trade_id: int,
+        fill_price: float,
+        slippage_pct: float,
+    ):
+        """
+        Record the actual IBKR fill price for the entry order.
+
+        fill_price   : avgPrice from IBKR execution fills
+        slippage_pct : (fill_price - entry_price) / entry_price
+                       positive = filled worse than quote (BUY slippage)
+                       negative = filled better than quote
+        """
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE trades SET fill_price=?, slippage_pct=?, status='filled' WHERE id=?",
+                (fill_price, slippage_pct, trade_id),
+            )
 
     def update_trade_exit(
         self,

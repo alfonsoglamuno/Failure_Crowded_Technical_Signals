@@ -244,6 +244,56 @@ class IBKRFeed:
 
         return False
 
+    def get_bid_ask_depth(
+        self, contract: Stock, fallback_price: float = 0.0
+    ) -> dict:
+        """
+        Fetch L1 bid/ask with available sizes.
+
+        Returns:
+            {
+              'bid': float, 'ask': float,
+              'bid_size': float, 'ask_size': float,   # shares available at L1
+              'mid': float
+            }
+
+        ask_size tells you how many shares are available at the ask price.
+        For a BUY market order of `qty` shares:
+          - If qty <= ask_size: likely fills entirely at ~ask price
+          - If qty > ask_size: order sweeps beyond L1 — actual fill price will be worse
+
+        bid_size is the mirror for SELL market orders.
+        """
+        try:
+            if getattr(contract, "conId", 0) and contract.exchange != "SMART":
+                mkt_contract = Stock(contract.symbol, "SMART", contract.currency)
+                mkt_contract.conId = contract.conId
+            else:
+                mkt_contract = contract
+
+            ticker = self.ib.reqMktData(mkt_contract, "", snapshot=False, regulatorySnapshot=False)
+            for _ in range(8):
+                self.ib.sleep(0.5)
+                bid, ask = ticker.bid, ticker.ask
+                bid_sz, ask_sz = ticker.bidSize, ticker.askSize
+                if (bid and ask
+                        and not math.isnan(bid) and not math.isnan(ask)
+                        and bid > 0 and ask > 0):
+                    self.ib.cancelMktData(mkt_contract)
+                    return {
+                        "bid": float(bid),
+                        "ask": float(ask),
+                        "bid_size": float(bid_sz) if bid_sz and not math.isnan(bid_sz) else 0.0,
+                        "ask_size": float(ask_sz) if ask_sz and not math.isnan(ask_sz) else 0.0,
+                        "mid": (float(bid) + float(ask)) / 2,
+                    }
+            self.ib.cancelMktData(mkt_contract)
+        except Exception as e:
+            log.warning("get_bid_ask_depth failed for %s: %s", contract.symbol, e)
+
+        fp = fallback_price
+        return {"bid": fp, "ask": fp, "bid_size": 0.0, "ask_size": 0.0, "mid": fp}
+
     def get_latest_price(self, contract: Stock, fallback_price: float = 0.0) -> float:
         """
         Get current market price for a contract.

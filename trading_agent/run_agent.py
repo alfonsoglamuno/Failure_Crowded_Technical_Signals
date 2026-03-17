@@ -656,11 +656,15 @@ def run_once(paper: bool, cfg: dict):
                 log.warning("Contract qualification failed for %s — skipping", sig.ticker)
                 continue
 
-            # Get current price; fall back to last OHLCV close if live quote unavailable
+            # ── L1 bid/ask depth: price + available volume at quoted price ────────
+            # For EURO STOXX 50 stocks with ~2,000 EUR positions (typically 20-50
+            # shares) L1 liquidity is almost always sufficient, but we log it for
+            # every live trade so slippage is visible in the trading log.
             ohlcv = universe_data.get(sig.ticker, __import__("pandas").DataFrame())
             fallback = float(ohlcv["close"].iloc[-1]) if not ohlcv.empty and "close" in ohlcv.columns else 0.0
-            current_price = feed.get_latest_price(contract, fallback_price=fallback)
+            depth = feed.get_bid_ask_depth(contract, fallback_price=fallback)
 
+            current_price = depth["mid"] if depth["mid"] > 0 else fallback
             if current_price <= 0:
                 log.warning("No price available for %s — skipping", sig.ticker)
                 continue
@@ -669,13 +673,30 @@ def run_once(paper: bool, cfg: dict):
             if sizing is None:
                 continue
 
+            # Liquidity check: warn if order size may exceed available L1 volume
+            liq = risk.check_liquidity(
+                direction=sig.trade_direction,
+                quantity=sizing["quantity"],
+                bid=depth["bid"],
+                ask=depth["ask"],
+                bid_size=depth["bid_size"],
+                ask_size=depth["ask_size"],
+                ticker=sig.ticker,
+            )
+
             log.info(
                 "[SIGNAL] %s %s P(failure)=%.3f crowd=%.2f -> %s "
-                "qty=%d entry=%.4f SL=%.4f TP=%.4f%s",
+                "qty=%d  bid=%.4f(%.0fsh) ask=%.4f(%.0fsh)  "
+                "entry=%.4f SL=%.4f TP=%.4f  spread=%.3f%%%s",
                 sig.action, sig.ticker, sig.failure_proba, sig.crowding_score,
-                sig.trade_direction, sizing["quantity"], sizing["entry_price"],
+                sig.trade_direction,
+                sizing["quantity"],
+                depth["bid"], depth["bid_size"],
+                depth["ask"], depth["ask_size"],
+                sizing["entry_price"],
                 sizing["stop_loss"], sizing["take_profit"],
-                " [regime-boost]" if sig.regime_boost_applied else "",
+                liq["spread_pct"] * 100,
+                " [SWEEP RISK]" if liq["sweep_risk"] else "",
             )
 
             result = executor.place_bracket(
@@ -690,7 +711,7 @@ def run_once(paper: bool, cfg: dict):
             )
 
             signal_id = signal_id_map.get(f"{sig.ticker}|{sig.alert_name}", -1)
-            journal.log_trade(
+            trade_id = journal.log_trade(
                 signal_id=signal_id,
                 ticker=sig.ticker,
                 ibkr_symbol=result.ibkr_symbol,
@@ -705,9 +726,20 @@ def run_once(paper: bool, cfg: dict):
                 trade_date=today,
             )
 
-            if result.status == "submitted":
+            # Record actual fill price (captured in executor after market order fills)
+            if result.actual_fill_price > 0 and trade_id:
+                journal.update_entry_fill(
+                    trade_id=trade_id,
+                    fill_price=result.actual_fill_price,
+                    slippage_pct=result.slippage_pct,
+                )
+
+            if result.status in ("submitted", "filled"):
                 n_trades += 1
-                log.info("Order submitted for %s (orderId=%d)", sig.ticker, result.parent_order_id)
+                fill_info = (f"fill=%.4f slippage={result.slippage_pct*100:+.3f}%%" % result.actual_fill_price
+                             if result.actual_fill_price > 0 else "fill pending")
+                log.info("Order placed for %s (orderId=%d  %s)",
+                         sig.ticker, result.parent_order_id, fill_info)
             else:
                 log.error("Order FAILED for %s: %s", sig.ticker, result.error_msg)
 

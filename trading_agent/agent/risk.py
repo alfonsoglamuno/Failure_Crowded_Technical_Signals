@@ -100,3 +100,56 @@ class RiskManager:
             "take_profit": round(take_profit, 4),
             "position_value_eur": round(position_value, 2),
         }
+
+    def check_liquidity(
+        self,
+        direction: str,
+        quantity: int,
+        bid: float,
+        ask: float,
+        bid_size: float,
+        ask_size: float,
+        ticker: str = "",
+    ) -> dict:
+        """
+        Pre-trade L1 liquidity check.
+
+        For a BUY market order the available liquidity is at the ask side.
+        For a SELL market order the available liquidity is at the bid side.
+
+        Returns a dict with:
+          estimated_fill_price : best estimate of where the market order fills
+          available_size       : shares available at the quoted price
+          sweep_risk           : True if qty > available L1 size (order walks the book)
+          spread_pct           : bid/ask spread as a fraction of mid price
+        """
+        if direction == "BUY":
+            quoted_price   = ask
+            available_size = ask_size
+        else:
+            quoted_price   = bid
+            available_size = bid_size
+
+        mid   = (bid + ask) / 2 if bid > 0 and ask > 0 else quoted_price
+        sweep = available_size > 0 and quantity > available_size
+        spread_pct = ((ask - bid) / mid) if mid > 0 else 0.0
+
+        if sweep:
+            log.warning(
+                "[LIQUIDITY] %s %s %d shares — only %.0f available at L1 quote %.4f. "
+                "Market order may fill at a worse average price.",
+                ticker, direction, quantity, available_size, quoted_price,
+            )
+        if spread_pct > 0.002:   # spread > 0.20% — wider than typical for STOXX50
+            log.warning(
+                "[LIQUIDITY] %s spread is %.2f%% (bid=%.4f ask=%.4f) — "
+                "wider than usual, consider limit order.",
+                ticker, spread_pct * 100, bid, ask,
+            )
+
+        return {
+            "estimated_fill_price": quoted_price,
+            "available_size": available_size,
+            "sweep_risk": sweep,
+            "spread_pct": spread_pct,
+        }
