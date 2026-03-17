@@ -21,7 +21,7 @@ risk:
   max_position_pct: 0.02         # 2% of NAV per trade = ~2,000 EUR per position
   stop_loss_pct: 0.01            # 1% stop-loss (tighter for intraday)
   take_profit_pct: 0.02          # 2% take-profit  →  risk/reward = 2:1 (achievable intraday)
-  max_trades_per_day: 20         # soft limit (no hard cap)
+  max_trades_per_day: 999        # no cap — trade as long as day is not a loss (gated by daily_loss + position slots)
   min_trade_size_eur: 500.0      # Min 500€ — meaningful enough to matter
   commission_per_trade_eur: 5.0  # ~0.05% × 2000€ × 2 = ~2€ + fees, rounded up
 
