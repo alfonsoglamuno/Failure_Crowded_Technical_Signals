@@ -135,6 +135,26 @@ def run_once(paper: bool, cfg: dict):
         return
 
     try:
+        # ── Cancel stale PreSubmitted DAY orders from previous sessions ──────
+        # IBKR paper sometimes fails to auto-expire DAY market orders for exotic
+        # exchanges (e.g. HEX/EUSTARS for NOKIA). Cancel them on reconnect so
+        # they don't block position slots or generate journal noise.
+        try:
+            stale_cancelled = 0
+            for trade in feed.ib.trades():
+                o = trade.order
+                if (getattr(o, "orderType", "") in ("MKT", "LMT")
+                        and getattr(o, "tif", "") == "DAY"
+                        and getattr(o, "parentId", 0) == 0   # parent only
+                        and trade.orderStatus.status == "PreSubmitted"):
+                    feed.ib.cancelOrder(o)
+                    stale_cancelled += 1
+            if stale_cancelled:
+                feed.ib.sleep(1)
+                log.info("Cancelled %d stale PreSubmitted DAY parent order(s)", stale_cancelled)
+        except Exception as e:
+            log.warning("Stale order cleanup failed: %s", e)
+
         # ── Check exits from previous bracket orders ──────────────────────────
         monitor = PositionMonitor(feed.ib, journal, learner,
                                   commission=cfg["risk"]["commission_per_trade_eur"])

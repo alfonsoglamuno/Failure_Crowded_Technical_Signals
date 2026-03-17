@@ -170,7 +170,8 @@ class PositionMonitor:
                     if new_sl != current_sl:
                         sl_trade.order.auxPrice = new_sl
                         try:
-                            self.ib.modifyOrder(contract, sl_trade.order)
+                            # ib_insync: modify by re-submitting with same orderId
+                            self.ib.placeOrder(contract, sl_trade.order)
                             log.info("[TRAIL] %s  SL %.4f -> %.4f  (gain +%.2f%%)",
                                      ticker, current_sl, new_sl, unrealized_pct * 100)
                         except Exception as e:

@@ -38,7 +38,7 @@ contracts:
   "MRK.DE":    {symbol: "MRK",    exchange: "XETRA", currency: "EUR"}
   "MUV2.DE":   {symbol: "MUV2",   exchange: "XETRA", currency: "EUR"}
   "NG.L":      {symbol: "NG",     exchange: "LSE",   currency: "GBP"}
-  "NOKIA.HE":  {symbol: "NOKIA",  exchange: "HEX",   currency: "EUR"}
+  # "NOKIA.HE": disabled — HEX/EUSTARS not executable on IBKR paper account (orders stay PreSubmitted)
   "OR.PA":     {symbol: "OR",     exchange: "SBF",   currency: "EUR"}
   "PHIA.AS":   {symbol: "PHIA",   exchange: "AEB",   currency: "EUR"}
   "PRX.AS":    {symbol: "PRX",    exchange: "AEB",   currency: "EUR"}
