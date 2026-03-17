@@ -255,20 +255,41 @@ class PositionMonitor:
                         "fill_date": fill.time,
                     }
 
-            # ── Cross-session fallback: executions + open-order map ──────────
-            if not result:
-                fills = self.ib.reqExecutions()
-                open_orders = self.ib.reqAllOpenOrders()
-                parent_map = {o.orderId: o.parentId
-                              for o in open_orders if getattr(o, "parentId", 0)}
-                for fill_item in fills:
-                    exec_ = fill_item.execution
-                    parent_id = parent_map.get(exec_.orderId)
-                    if parent_id and parent_id not in result:
-                        result[parent_id] = {
+            # ── Cross-session fallback: position-based detection ─────────────
+            # reqAllOpenOrders() only returns OPEN orders — once SL/TP fires,
+            # those orders vanish and we lose the parentId link.
+            # Instead: if journal says a symbol is open but IBKR has no position,
+            # the trade was closed. Find the exit price from today's executions.
+            current_pos_symbols = {
+                pos.contract.symbol
+                for pos in self.ib.positions()
+                if pos.position > 0
+            }
+            all_fills = self.ib.reqExecutions()
+            # Most recent SELL fill per symbol
+            sell_fills: dict[str, dict] = {}
+            for fi in all_fills:
+                exec_ = fi.execution
+                side  = getattr(exec_, "side", "")
+                if side in ("SLD", "SELL"):
+                    sym = fi.contract.symbol
+                    if sym not in sell_fills:
+                        sell_fills[sym] = {
                             "price": exec_.avgPrice,
                             "fill_date": exec_.time,
                         }
+
+            open_trades = self._get_open_journal_trades()
+            for t in open_trades:
+                parent_id   = t.get("ibkr_order_id")
+                ibkr_symbol = t.get("ibkr_symbol", "")
+                if not parent_id or not ibkr_symbol or parent_id in result:
+                    continue
+                if ibkr_symbol not in current_pos_symbols and ibkr_symbol in sell_fills:
+                    result[parent_id] = sell_fills[ibkr_symbol]
+                    log.info("Cross-session exit detected: %s @ %.4f",
+                             ibkr_symbol, sell_fills[ibkr_symbol]["price"])
+
         except Exception as e:
             log.warning("Could not fetch exit orders: %s", e)
         return result

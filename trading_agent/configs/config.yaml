@@ -19,21 +19,16 @@ risk:
   # ── Trial / paper account — large virtual capital, commissions not a constraint ──
   max_daily_loss_eur: 300.0      # Stop trading today if down 300€ (0.3% of 100K)
   max_position_pct: 0.02         # 2% of NAV per trade = ~2,000 EUR per position
-  stop_loss_pct: 0.01            # 1% stop-loss (tighter for intraday)
-  take_profit_pct: 0.02          # 2% take-profit  →  risk/reward = 2:1 (achievable intraday)
+  stop_loss_pct: 0.015           # 1.5% SL — STOXX50 daily ATR ~1.5%, 1% caused noise stops
+  take_profit_pct: 0.025         # 2.5% TP — momentum continuation on oversold bounces averages 2-3%
   max_trades_per_day: 999        # no cap — trade as long as day is not a loss (gated by daily_loss + position slots)
   min_trade_size_eur: 500.0      # Min 500€ — meaningful enough to matter
   commission_per_trade_eur: 5.0  # ~0.05% × 2000€ × 2 = ~2€ + fees, rounded up
 
   # Active position management
-  trail_trigger_pct: 0.005       # 0.5% gain → start trailing stop
-  trail_step_pct: 0.003          # trail SL 0.3% below current price (locks in ~break-even)
-  max_hold_hours: 4.0            # time exit if open > 4h without meaningful gain
-
-  # Break-even at these params (2,000€ position, 5€ commission):
-  #   TP gross = 2000 × 0.02 = 40€  →  net = 35€
-  #   SL gross = 2000 × 0.01 = 20€  →  net loss = 25€
-  #   Break-even hit rate = 25 / (35 + 25) = 41.7%  (model achieves ~57%)
+  trail_trigger_pct: 0.010       # 1.0% gain triggers trailing (0.5% was inside STOXX50 noise)
+  trail_step_pct: 0.005          # trail SL 0.5% below current → locks in half the trigger gain
+  max_hold_hours: 5.0            # 5h: holds through US open at 15:30 CET (second leg for EU stocks)
 
 strategy:
   fade_threshold: 0.60      # P(failure) >= 0.60 → FADE  (lowered from 0.65 — more signals)
