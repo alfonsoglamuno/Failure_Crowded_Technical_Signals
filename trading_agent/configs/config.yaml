@@ -25,6 +25,11 @@ risk:
   min_trade_size_eur: 500.0      # Min 500€ — meaningful enough to matter
   commission_per_trade_eur: 5.0  # ~0.05% × 2000€ × 2 = ~2€ + fees, rounded up
 
+  # Active position management
+  trail_trigger_pct: 0.005       # 0.5% gain → start trailing stop
+  trail_step_pct: 0.003          # trail SL 0.3% below current price (locks in ~break-even)
+  max_hold_hours: 4.0            # time exit if open > 4h without meaningful gain
+
   # Break-even at these params (2,000€ position, 5€ commission):
   #   TP gross = 2000 × 0.02 = 40€  →  net = 35€
   #   SL gross = 2000 × 0.01 = 20€  →  net loss = 25€
@@ -36,7 +41,8 @@ strategy:
   default_horizon: 1        # 1-day hold, intraday focus
   allow_short: false        # SHORT DISABLED — IBKR paper borrow not available for European stocks.
                             # Re-enable once IBKR confirms short locates are working on live account.
-  scan_interval_min: 30     # scan every 30 minutes during market hours
+  monitor_interval_min: 5   # fast loop: trail stops + time exits (every 5 min)
+  scan_interval_min: 30     # slow loop: full signal scan (every 30 min)
   eod_close_time: "16:30"   # close all positions before exchange close (CET)
   max_open_positions: 10    # max simultaneous open long positions
 

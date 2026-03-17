@@ -1,19 +1,22 @@
 """
-Position monitor — checks open bracket orders against IBKR fills
-and records outcomes to the journal so the learner can act on them.
-
-Call monitor.check_exits() at the start of each daily cycle,
-before placing new orders.
+Position monitor — checks open bracket orders against IBKR fills,
+trails stop-losses, and enforces time-based exits.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, datetime, timezone
 
-from ib_insync import IB
+from ib_insync import IB, MarketOrder, Stock, StopOrder
 
 log = logging.getLogger(__name__)
+
+
+def _tick_round(price: float) -> float:
+    """Round to nearest 0.01 tick (safe default for Euro STOXX 50 names)."""
+    tick = 0.01
+    return round(round(price / tick) * tick, 4)
 
 
 class PositionMonitor:
@@ -22,6 +25,8 @@ class PositionMonitor:
         self.journal = journal
         self.learner = learner
         self.commission = commission
+
+    # ── Exit sync ──────────────────────────────────────────────────────────
 
     def check_exits(self):
         """
@@ -41,7 +46,6 @@ class PositionMonitor:
             if order_id is None:
                 continue
 
-            # Look for a child order fill (TP or SL) associated with this parent
             exit_fill = filled_orders.get(order_id)
             if exit_fill is None:
                 continue
@@ -66,7 +70,6 @@ class PositionMonitor:
                 commission=self.commission,
             )
 
-            # Feed outcome to the learner immediately
             self.learner.record_outcome(
                 alert_name=trade.get("alert_name", "unknown"),
                 action=trade.get("action", "FADE"),
@@ -78,8 +81,149 @@ class PositionMonitor:
                 trade.get("ticker"), entry_price, exit_price, pnl_net,
             )
 
+    # ── Active position management ─────────────────────────────────────────
+
+    def monitor_positions(self, contracts_cfg: dict, feed, cfg: dict, account: str = ""):
+        """
+        Trail stops and enforce time-based exits. Called every 5 minutes.
+
+        Trailing stop logic:
+          Once unrealized gain >= trail_trigger_pct, raise SL to
+          (current_price - trail_step_pct). Never lowers SL.
+          Effect: locks in break-even at +0.5%, then keeps trailing upward.
+
+        Time exit:
+          If position has been open > max_hold_hours AND gain is still below
+          half the trail trigger, close flat. Avoids dead-money drag.
+        """
+        open_trades = self._get_open_journal_trades()
+        if not open_trades:
+            log.debug("No open trades to monitor")
+            return
+
+        trail_trigger = cfg["risk"].get("trail_trigger_pct", 0.005)
+        trail_step    = cfg["risk"].get("trail_step_pct",    0.003)
+        max_hold_h    = cfg["risk"].get("max_hold_hours",    4.0)
+
+        # Fetch active stop orders from IBKR, keyed by parentId
+        self.ib.reqAllOpenOrders()
+        self.ib.sleep(1)
+        stop_trades = {
+            t.order.parentId: t
+            for t in self.ib.trades()
+            if isinstance(t.order, StopOrder)
+            and getattr(t.order, "parentId", 0)
+            and t.orderStatus.status not in ("Filled", "Cancelled", "Inactive")
+        }
+        log.info("Active stop orders tracked: %d  |  Open journal trades: %d",
+                 len(stop_trades), len(open_trades))
+
+        for rec in open_trades:
+            ticker    = rec.get("ticker", "")
+            parent_id = rec.get("ibkr_order_id")
+            entry_px  = rec.get("entry_price") or 0
+            direction = rec.get("trade_direction", "BUY")
+
+            if not parent_id or not entry_px:
+                continue
+
+            spec = contracts_cfg.get(ticker)
+            if not spec:
+                log.debug("No contract spec for %s — skipping monitor", ticker)
+                continue
+            contract = Stock(spec["symbol"], "SMART", spec["currency"])
+
+            current_px = feed.get_latest_price(contract, fallback_price=entry_px)
+            if current_px <= 0:
+                log.warning("No price for %s — skipping monitor", ticker)
+                continue
+
+            # Hours since journal entry timestamp (UTC)
+            try:
+                entry_time = datetime.fromisoformat(rec["ts"]).replace(tzinfo=timezone.utc)
+                hours_open = (datetime.now(timezone.utc) - entry_time).total_seconds() / 3600
+            except Exception:
+                hours_open = 0.0
+
+            unrealized_pct = (
+                (current_px - entry_px) / entry_px if direction == "BUY"
+                else (entry_px - current_px) / entry_px
+            )
+
+            log.info("[MONITOR] %s  px=%.4f  entry=%.4f  P&L=%.2f%%  open=%.1fh",
+                     ticker, current_px, entry_px, unrealized_pct * 100, hours_open)
+
+            # ── Trailing stop ──────────────────────────────────────────────
+            if unrealized_pct >= trail_trigger:
+                if parent_id in stop_trades:
+                    sl_trade   = stop_trades[parent_id]
+                    current_sl = sl_trade.order.auxPrice
+
+                    if direction == "BUY":
+                        new_sl = _tick_round(max(current_sl, current_px * (1 - trail_step)))
+                    else:
+                        new_sl = _tick_round(min(current_sl, current_px * (1 + trail_step)))
+
+                    if new_sl != current_sl:
+                        sl_trade.order.auxPrice = new_sl
+                        try:
+                            self.ib.modifyOrder(contract, sl_trade.order)
+                            log.info("[TRAIL] %s  SL %.4f -> %.4f  (gain +%.2f%%)",
+                                     ticker, current_sl, new_sl, unrealized_pct * 100)
+                        except Exception as e:
+                            log.warning("Trail SL modify failed for %s: %s", ticker, e)
+                    else:
+                        log.debug("[TRAIL] %s  SL already at max (%.4f)", ticker, current_sl)
+                else:
+                    log.debug("[TRAIL] %s  no active stop order found (may have filled)", ticker)
+
+            # ── Time exit ─────────────────────────────────────────────────
+            if hours_open >= max_hold_h and unrealized_pct < trail_trigger / 2:
+                log.info("[TIME EXIT] %s open %.1fh unrealized %.2f%% — closing flat",
+                         ticker, hours_open, unrealized_pct * 100)
+                self._force_exit(rec, contract, current_px, account)
+
+    def _force_exit(self, rec: dict, contract: Stock, current_px: float, account: str = ""):
+        """Cancel bracket children and exit with a market order."""
+        parent_id = rec.get("ibkr_order_id")
+        direction = rec.get("trade_direction", "BUY")
+        qty       = int(rec.get("quantity", 0))
+
+        # Cancel TP and SL child orders first
+        for t in self.ib.trades():
+            if getattr(t.order, "parentId", 0) == parent_id:
+                try:
+                    self.ib.cancelOrder(t.order)
+                except Exception:
+                    pass
+        self.ib.sleep(1)
+
+        if qty > 0:
+            exit_action = "SELL" if direction == "BUY" else "BUY"
+            order = MarketOrder(exit_action, qty)
+            order.tif = "DAY"
+            if account:
+                order.account = account
+            self.ib.placeOrder(contract, order)
+            log.info("[TIME EXIT] Market %s %d %s @ ~%.4f",
+                     exit_action, qty, contract.symbol, current_px)
+
+        # Record estimated exit in journal
+        entry_px  = rec.get("entry_price", current_px)
+        pnl_gross = ((current_px - entry_px) * qty if direction == "BUY"
+                     else (entry_px - current_px) * qty)
+        self.journal.update_trade_exit(
+            trade_id=rec["id"],
+            exit_price=current_px,
+            exit_date=date.today(),
+            pnl_gross=pnl_gross,
+            commission=self.commission,
+        )
+
+    # ── Helpers ───────────────────────────────────────────────────────────
+
     def _get_open_journal_trades(self) -> list[dict]:
-        """Trades marked 'submitted' or 'filled' with no exit price yet."""
+        """Trades marked submitted/filled with no exit price yet."""
         all_trades = self.journal.get_recent_trades(n=50)
         return [
             t for t in all_trades
@@ -101,7 +245,7 @@ class PositionMonitor:
             for trade in self.ib.trades():
                 order = trade.order
                 if not getattr(order, "parentId", 0):
-                    continue   # skip parent orders and standalone orders
+                    continue
                 if trade.orderStatus.status != "Filled":
                     continue
                 if order.parentId not in result and trade.fills:
@@ -115,7 +259,6 @@ class PositionMonitor:
             if not result:
                 fills = self.ib.reqExecutions()
                 open_orders = self.ib.reqAllOpenOrders()
-                # Build orderId → parentId from currently open orders
                 parent_map = {o.orderId: o.parentId
                               for o in open_orders if getattr(o, "parentId", 0)}
                 for fill_item in fills:

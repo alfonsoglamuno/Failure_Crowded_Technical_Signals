@@ -417,6 +417,57 @@ def run_once(paper: bool, cfg: dict):
         feed.disconnect()
 
 
+def _monitor_open_positions(paper: bool, cfg: dict):
+    """
+    Fast cycle (every 5 min): trail stop-losses and enforce time-based exits.
+    Does NOT scan for new signals — that stays in run_once (every 30 min).
+    Skips IBKR connection entirely if journal has no open trades.
+    """
+    from agent.data_feed import IBKRFeed, load_contracts
+    from agent.journal import Journal
+    from agent.model import FailurePredictor
+    from agent.learner import AdaptiveLearner
+    from agent.monitor import PositionMonitor
+
+    journal = Journal(cfg["journal"]["db_path"])
+
+    # Fast check — avoid connecting to IBKR if nothing is open
+    open_trades = [
+        t for t in journal.get_recent_trades(50)
+        if t.get("status") in ("submitted", "filled") and t.get("exit_price") is None
+    ]
+    if not open_trades:
+        log.debug("No open trades — skipping position monitor")
+        return
+
+    contracts_cfg = load_contracts(cfg["universe"]["ibkr_contracts_file"])
+    predictor = FailurePredictor(
+        model_path=cfg["model"]["path"],
+        feature_cols_path=cfg["model"]["feature_cols_path"],
+    )
+    predictor.load()
+    learner = AdaptiveLearner(cfg, journal, predictor)
+
+    feed = IBKRFeed(cfg, paper=paper)
+    try:
+        feed.connect()
+        monitor = PositionMonitor(
+            feed.ib, journal, learner,
+            commission=cfg["risk"]["commission_per_trade_eur"],
+        )
+        monitor.check_exits()
+        monitor.monitor_positions(
+            contracts_cfg=contracts_cfg,
+            feed=feed,
+            cfg=cfg,
+            account=feed.account_id,
+        )
+    except Exception as e:
+        log.warning("Position monitor cycle error: %s", e)
+    finally:
+        feed.disconnect()
+
+
 def _eod_close(paper: bool, cfg: dict):
     """Cancel all bracket orders and close open long positions with market orders."""
     from agent.data_feed import IBKRFeed, load_contracts
@@ -501,15 +552,23 @@ def main():
         run_once(paper=not args.live, cfg=cfg)
         return
 
-    # Continuous intraday monitoring loop
-    scan_interval = cfg["strategy"].get("scan_interval_min", 30) * 60
-    eod_str = cfg["strategy"].get("eod_close_time", "16:30")
-    eod_h, eod_m = int(eod_str.split(":")[0]), int(eod_str.split(":")[1])
+    # Dual-speed intraday loop:
+    #   Fast  (monitor_interval_min =  5 min): trail stops + time exits
+    #   Slow  (scan_interval_min    = 30 min): full signal scan + new trades
+    monitor_interval = cfg["strategy"].get("monitor_interval_min", 5) * 60
+    scan_interval    = cfg["strategy"].get("scan_interval_min", 30) * 60
+    eod_str          = cfg["strategy"].get("eod_close_time", "16:30")
+    eod_h, eod_m     = int(eod_str.split(":")[0]), int(eod_str.split(":")[1])
 
     log.info(
-        "Intraday monitor started — scanning every %d min, EOD close at %s CET (Ctrl+C to stop)",
-        cfg["strategy"].get("scan_interval_min", 30), eod_str,
+        "Intraday monitor started — position check every %d min, "
+        "signal scan every %d min, EOD close at %s CET (Ctrl+C to stop)",
+        cfg["strategy"].get("monitor_interval_min", 5),
+        cfg["strategy"].get("scan_interval_min", 30),
+        eod_str,
     )
+
+    last_scan_time = 0.0   # force immediate scan on startup
 
     while True:
         now = datetime.now(CET)
@@ -518,16 +577,21 @@ def main():
         if now.weekday() < 5 and now.hour == eod_h and now.minute >= eod_m and now.minute < eod_m + 5:
             log.info("EOD close time reached (%s CET) — closing all open positions", eod_str)
             _eod_close(paper=not args.live, cfg=cfg)
-            # Sleep past the 5-minute window so we don't run it again
-            time.sleep(300)
+            time.sleep(300)   # sleep past the 5-min window
             continue
 
         if is_market_open(now):
-            run_once(paper=not args.live, cfg=cfg)
+            # Fast loop — always runs (trail stops, time exits, exit sync)
+            _monitor_open_positions(paper=not args.live, cfg=cfg)
+
+            # Slow loop — full signal scan every scan_interval
+            if time.time() - last_scan_time >= scan_interval:
+                run_once(paper=not args.live, cfg=cfg)
+                last_scan_time = time.time()
         else:
             log.info("Market closed at %s — waiting...", now.strftime("%H:%M CET"))
 
-        time.sleep(scan_interval)
+        time.sleep(monitor_interval)
 
 
 if __name__ == "__main__":
