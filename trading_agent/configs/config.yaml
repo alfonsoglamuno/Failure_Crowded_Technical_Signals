@@ -16,21 +16,53 @@ capital:
   currency: EUR
 
 risk:
-  # ── Trial / paper account — large virtual capital, commissions not a constraint ──
-  max_daily_loss_eur: 300.0      # Stop trading today if down 300€ (0.3% of 100K)
+  # ── Shared / account-level limits ────────────────────────────────────────────
+  max_daily_loss_eur: 300.0      # Stop trading today if down 300 EUR (0.3% of 100K)
   max_position_pct: 0.02         # 2% of NAV per trade = ~2,000 EUR per position
-  stop_loss_pct: 0.015           # 1.5% SL — STOXX50 daily ATR ~1.5%, 1% caused noise stops
-  take_profit_pct: 0.025         # 2.5% TP — momentum continuation on oversold bounces averages 2-3%
-  max_trades_per_day: 999        # no cap — trade as long as day is not a loss (gated by daily_loss + position slots)
-  min_trade_size_eur: 500.0      # Min 500€ — meaningful enough to matter
+  max_trades_per_day: 999        # no cap — gated by daily_loss + position slots
+  min_trade_size_eur: 500.0      # Min 500 EUR — meaningful enough to matter
   commission_rate_pct: 0.05      # IBKR fee: 0.05% of trade value (tiered pricing)
-  commission_min_eur: 2.0        # IBKR minimum fee per order (~1.75–2 EUR for European stocks)
+  commission_min_eur: 2.0        # IBKR minimum fee per order (~2 EUR for European stocks)
   commission_per_trade_eur: 10.0 # legacy flat fallback (used only when trade value unknown)
 
-  # Active position management
-  trail_trigger_pct: 0.010       # 1.0% gain triggers trailing (0.5% was inside STOXX50 noise)
-  trail_step_pct: 0.005          # trail SL 0.5% below current → locks in half the trigger gain
-  max_hold_hours: 5.0            # 5h: holds through US open at 15:30 CET (second leg for EU stocks)
+  # ── Default SL/TP/trail (used when no per-horizon override applies) ──────────
+  stop_loss_pct: 0.015           # 1.5% — STOXX50 daily ATR ~1.5%
+  take_profit_pct: 0.025         # 2.5% — reward/risk 1.67:1
+  trail_trigger_pct: 0.010       # 1.0% gain triggers trailing
+  trail_step_pct: 0.005          # 0.5% trail step
+  max_hold_hours: 6.5            # dead-money exit after 6.5h (h1d only)
+
+  # ── Per-horizon overrides ─────────────────────────────────────────────────────
+  # These replace the defaults above when the active model horizon matches.
+  # Wider SL/TP for longer holds: multi-day noise is bigger than intraday noise.
+  # Reward/risk ratio kept at ~1.67:1 across all horizons.
+  #
+  # h1d (intraday, EOD close): tight exits — price must move decisively same day.
+  #   ATR ~1.5%/day  →  SL=1.5%, TP=2.5%
+  h1d:
+    stop_loss_pct: 0.015
+    take_profit_pct: 0.025
+    trail_trigger_pct: 0.010     # 1.0% gain before trailing
+    trail_step_pct: 0.005        # 0.5% step
+    max_hold_hours: 6.5          # dead-money exit after 6.5h open
+
+  # h3d (swing, 3-day hold): wider range — 3-day ATR ~3-4%.
+  #   SL=2.5%, TP=4.0% → reward/risk 1.60:1
+  h3d:
+    stop_loss_pct: 0.025
+    take_profit_pct: 0.040
+    trail_trigger_pct: 0.015     # 1.5% before trailing
+    trail_step_pct: 0.008        # 0.8% step — preserves most gain
+    max_hold_hours: 9999         # no hourly exit; multi-day positions managed by days
+
+  # h5d (position, 5-day hold): 5-day ATR ~5-6%.
+  #   SL=3.5%, TP=6.0% → reward/risk 1.71:1
+  h5d:
+    stop_loss_pct: 0.035
+    take_profit_pct: 0.060
+    trail_trigger_pct: 0.020     # 2.0% before trailing
+    trail_step_pct: 0.010        # 1.0% step
+    max_hold_hours: 9999         # no hourly exit
 
 strategy:
   fade_threshold: 0.60      # P(failure) >= 0.60 → FADE  (lowered from 0.65 — more signals)
@@ -40,7 +72,8 @@ strategy:
                             # Re-enable once IBKR confirms short locates are working on live account.
   monitor_interval_min: 5   # fast loop: trail stops + time exits (every 5 min)
   scan_interval_min: 30     # slow loop: full signal scan (every 30 min)
-  eod_close_time: "16:30"   # close all positions before exchange close (CET)
+  eod_close_time: "16:27"   # close all positions 3 min BEFORE exchange close (CET).
+                            # Gives market orders 3 min to fill; 16:30 is too tight.
   max_open_positions: 10    # max simultaneous open long positions
 
   # Start with FADE only — we have more data on it. Enable FOLLOW after 50 FADE trades.
@@ -62,14 +95,22 @@ strategy:
 model:
   # Active model variant. Format: h{horizon}d_{mode}
   #   horizon : 1d (intraday, default) | 3d (swing) | 5d (multi-day position)
-  #   mode    : longonly (BUY entries only) | both (BUY + SELL, requires allow_short=true)
+  #   mode    : longonly (BUY entries only) | both (BUY + SELL direction scoring)
   #
-  # Default: h1d_longonly — intraday holds, long-only, EOD close.
-  # Use both mode ONLY after confirming IBKR short locates are available.
-  variant: "h1d_longonly"
+  # h1d_both is used here with allow_short=false:
+  #   - "both" scores ALL alert directions (bearish + bullish) → richer signal set
+  #   - allow_short=false means SELL entries are blocked at executor level
+  #   - Only BUY entries (FADE on bearish alerts) are placed
+  #   - With 7yr training data h1d_both is better calibrated than longonly:
+  #     AUC=0.605, P@0.60=67%, P@0.65=69% vs h1d_longonly which saturates
+  #     at P@0.50=75.3% with NO signals above 0.55 due to early XGBoost stopping.
+  #
+  # Re-evaluate monthly: if allow_short is enabled, both mode is natural.
+  # If switching to swing trading use h3d_longonly or h3d_both.
+  variant: "h1d_both"
   # Paths are derived from variant — change variant above, not paths below.
-  path: "data/model/xgboost_h1d_longonly.joblib"
-  feature_cols_path: "data/model/feature_cols_h1d_longonly.json"
+  path: "data/model/xgboost_h1d_both.joblib"
+  feature_cols_path: "data/model/feature_cols_h1d_both.json"
   min_history_days: 252
 
   # Learning loop — optimised for active paper trading (5 trades/day → fast feedback)
@@ -83,7 +124,10 @@ model:
   win_rate_target: 0.55               # Target hit rate
 
 data:
-  history_days: 730         # 2 years of calendar days (~500 trading days) for bootstrap
+  history_days: 2555        # 7 years of calendar days (~1785 trading days) — includes COVID 2020
+                            # Literature (Harvey et al. 2022, Bali et al. 2016): include stress regimes.
+                            # Exponential weighting (halflife=252d) means 2020 data carries ~13% weight
+                            # vs today's 100%, so model stays current without discarding the crisis.
   cache_dir: "data/cache"
   cache_max_age_hours: 20
 

@@ -28,25 +28,26 @@ CREATE TABLE IF NOT EXISTS signals (
 );
 
 CREATE TABLE IF NOT EXISTS trades (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    signal_id       INTEGER REFERENCES signals(id),
-    ts              TEXT NOT NULL,
-    date            TEXT NOT NULL,
-    ticker          TEXT NOT NULL,
-    ibkr_symbol     TEXT,
-    trade_direction TEXT,
-    quantity        REAL,
-    entry_price     REAL,
-    stop_loss       REAL,
-    take_profit     REAL,
-    ibkr_order_id   INTEGER,
-    status          TEXT,    -- submitted / filled / cancelled / error
-    fill_price      REAL,
-    exit_price      REAL,
-    exit_date       TEXT,
-    pnl_gross       REAL,
-    pnl_net         REAL,
-    paper           INTEGER  -- 1 = paper, 0 = live
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    signal_id           INTEGER REFERENCES signals(id),
+    ts                  TEXT NOT NULL,
+    date                TEXT NOT NULL,
+    ticker              TEXT NOT NULL,
+    ibkr_symbol         TEXT,
+    trade_direction     TEXT,
+    quantity            REAL,
+    entry_price         REAL,
+    stop_loss           REAL,
+    take_profit         REAL,
+    ibkr_order_id       INTEGER,
+    status              TEXT,    -- submitted / filled / cancelled / error / pending_close
+    fill_price          REAL,
+    exit_price          REAL,
+    exit_date           TEXT,
+    pnl_gross           REAL,
+    pnl_net             REAL,
+    paper               INTEGER, -- 1 = paper, 0 = live
+    hold_horizon_days   INTEGER DEFAULT 1  -- intended hold: 1=intraday, 3=swing, 5=multi-day
 );
 
 CREATE TABLE IF NOT EXISTS daily_summary (
@@ -82,12 +83,13 @@ class Journal:
                 except Exception:
                     pass  # column already exists
             for col, typedef in [
-                ("slippage_pct", "REAL"),
+                ("slippage_pct",         "REAL"),
+                ("hold_horizon_days",    "INTEGER DEFAULT 1"),
             ]:
                 try:
                     conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {typedef}")
                 except Exception:
-                    pass
+                    pass  # column already exists
 
     def log_signal(
         self,
@@ -149,6 +151,7 @@ class Journal:
         status: str,
         paper: bool,
         trade_date: date | None = None,
+        hold_horizon_days: int = 1,
     ) -> int:
         ts = datetime.utcnow().isoformat()
         d = str(trade_date or date.today())
@@ -157,11 +160,11 @@ class Journal:
                 """INSERT INTO trades
                    (signal_id, ts, date, ticker, ibkr_symbol, trade_direction,
                     quantity, entry_price, stop_loss, take_profit,
-                    ibkr_order_id, status, paper)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    ibkr_order_id, status, paper, hold_horizon_days)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (signal_id, ts, d, ticker, ibkr_symbol, trade_direction,
                  quantity, entry_price, stop_loss, take_profit,
-                 ibkr_order_id, status, int(paper)),
+                 ibkr_order_id, status, int(paper), hold_horizon_days),
             )
             return cur.lastrowid
 

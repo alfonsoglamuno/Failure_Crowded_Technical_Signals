@@ -420,7 +420,7 @@ def run_once(paper: bool, cfg: dict):
     with open(cfg["universe"]["parent_tickers_file"]) as f:
         tickers = yaml.safe_load(f)["tickers"]
 
-    risk = RiskManager(cfg)
+    risk = RiskManager(cfg, horizon_days=_parse_horizon(cfg["model"].get("variant", "h1d_both")))
     learner = AdaptiveLearner(cfg, journal, predictor)
 
     # ── Connect to IBKR ──────────────────────────────────────────────────────
@@ -700,6 +700,19 @@ def run_once(paper: bool, cfg: dict):
                 log.info("Skipping %s (GBP-denominated, EUR sizing not supported)", sig.ticker)
                 continue
 
+            # Hard guard: SELL entries are forbidden in long-only mode.
+            # strategy.py should filter these before they reach here; this is a
+            # belt-and-suspenders check so a config error or strategy bug cannot
+            # accidentally create a short position.
+            if sig.trade_direction == "SELL" and not _allow_short:
+                log.error(
+                    "BLOCKED SELL entry for %s at run_agent level — "
+                    "allow_short=False in config. Strategy should not emit SELL entries. "
+                    "Check strategy.py or config allow_short setting.",
+                    sig.ticker,
+                )
+                continue
+
             # Dedup — skip tickers already traded in an earlier scan today
             if sig.ticker in already_traded_today:
                 log.info("Skipping %s — already have an open trade from today's earlier scan", sig.ticker)
@@ -739,6 +752,16 @@ def run_once(paper: bool, cfg: dict):
                 continue
             if not feed.qualify_contract(contract):
                 log.warning("Contract qualification failed for %s — skipping", sig.ticker)
+                continue
+
+            # EUR-only guard: reject any contract that is not denominated in EUR.
+            # This prevents FX commission leakage and unintended cross-currency exposure.
+            if getattr(contract, "currency", "EUR") != "EUR":
+                log.error(
+                    "BLOCKED %s — contract currency is %s, not EUR. "
+                    "Remove this ticker from ibkr_contracts.yaml or fix its currency field.",
+                    sig.ticker, contract.currency,
+                )
                 continue
 
             # ── L1 bid/ask depth: price + available volume at quoted price ────────
@@ -792,7 +815,8 @@ def run_once(paper: bool, cfg: dict):
                 stop_loss=sizing["stop_loss"],
                 take_profit=sizing["take_profit"],
                 action=sig.action,
-                contract=contract,   # pass pre-qualified contract
+                contract=contract,
+                horizon_days=_horizon_days,   # drives DAY vs GTC TIF for TP/SL
             )
 
             signal_id = signal_id_map.get(f"{sig.ticker}|{sig.alert_name}", -1)
@@ -809,6 +833,7 @@ def run_once(paper: bool, cfg: dict):
                 status=result.status,
                 paper=paper,
                 trade_date=today,
+                hold_horizon_days=_horizon_days,
             )
 
             # Record actual fill price (captured in executor after market order fills)
@@ -1095,67 +1120,113 @@ def _evaluate_overnight_positions(paper: bool, cfg: dict):
 
 
 def _eod_close(paper: bool, cfg: dict):
-    """Cancel all bracket orders and close all open positions with market orders.
+    """Cancel intraday brackets and close intraday positions at EOD.
 
-    Handles both longs (SELL) and accidental shorts (BUY to cover).
-    Uses ib.positions() after a settle sleep to ensure complete position data.
+    Multi-day positions (hold_horizon_days > 1) are intentionally left open
+    overnight — their GTC SL/TP orders remain active and the morning check
+    will re-evaluate them the next session.
+
+    Accidental shorts are always covered regardless of horizon.
     """
     from agent.data_feed import IBKRFeed
+    from agent.journal import Journal
     from ib_insync import MarketOrder
     from dotenv import load_dotenv
     load_dotenv()
+
+    journal = Journal(cfg["journal"]["db_path"])
+
+    # Identify which IBKR symbols belong to intended multi-day positions
+    # (hold_horizon_days > 1) — we must NOT close or cancel orders for these.
+    open_trades = journal.get_recent_trades(n=100)
+    multiday_symbols: set[str] = set()
+    multiday_order_ids: set[int] = set()
+    for t in open_trades:
+        is_open = (
+            t.get("status") in ("submitted", "filled", "pending_close")
+            and t.get("exit_price") is None
+        )
+        if is_open and (t.get("hold_horizon_days") or 1) > 1:
+            sym = t.get("ibkr_symbol", "")
+            oid = t.get("ibkr_order_id")
+            if sym:
+                multiday_symbols.add(sym.upper())
+            if oid:
+                multiday_order_ids.add(oid)
+
+    if multiday_symbols:
+        log.info("EOD: keeping multi-day positions open: %s", sorted(multiday_symbols))
 
     feed = IBKRFeed(cfg, paper=paper)
     try:
         feed.connect()
         ib = feed.ib
         account = feed.account_id
-
-        # Give IBKR time to push all position/order data after reconnect
         ib.sleep(2)
 
-        # Cancel all open orders (TP/SL brackets and any stale orders)
+        # Cancel open orders that belong to INTRADAY positions only.
+        # Multi-day positions need their GTC SL/TP orders to survive overnight.
         open_orders = ib.reqAllOpenOrders()
         ib.sleep(1)
         cancelled = 0
+        kept = 0
         for t in open_orders:
+            order = t.order
+            parent_id = getattr(order, "parentId", 0) or order.orderId
+            # Skip cancellation if this order belongs to a multi-day position
+            if parent_id in multiday_order_ids:
+                kept += 1
+                continue
+            # Also skip if the contract symbol is a multi-day position
+            sym = getattr(t.contract, "symbol", "").upper()
+            if sym in multiday_symbols:
+                kept += 1
+                continue
             try:
-                ib.cancelOrder(t.order)
+                ib.cancelOrder(order)
                 cancelled += 1
             except Exception:
                 pass
         ib.sleep(2)
-        log.info("Cancelled %d open orders", cancelled)
+        log.info("EOD: cancelled %d intraday orders, kept %d multi-day orders",
+                 cancelled, kept)
 
-        # Close all non-zero positions
+        # Close all intraday positions (horizon=1) and any accidental shorts.
+        # Leave multi-day longs intact.
         positions = ib.positions()
         closed_long = 0
         closed_short = 0
+        skipped_multiday = 0
         for pos in positions:
             qty = int(pos.position)
             if qty == 0:
                 continue
+            sym = pos.contract.symbol.upper()
+            if qty > 0 and sym in multiday_symbols:
+                skipped_multiday += 1
+                log.info("EOD: leaving multi-day long open: %s qty=%d", sym, qty)
+                continue
             if qty > 0:
-                # Long: sell to close
                 order = MarketOrder("SELL", qty)
                 order.account = account
                 order.tif = "DAY"
                 ib.placeOrder(pos.contract, order)
-                log.info("EOD close LONG: SELL %d %s", qty, pos.contract.symbol)
+                log.info("EOD close LONG: SELL %d %s", qty, sym)
                 closed_long += 1
             else:
-                # Short (accidental): buy to cover
+                # Accidental short — always cover
                 order = MarketOrder("BUY", abs(qty))
                 order.account = account
                 order.tif = "DAY"
                 ib.placeOrder(pos.contract, order)
-                log.warning("EOD close SHORT: BUY %d %s (accidental short — covering)",
-                            abs(qty), pos.contract.symbol)
+                log.warning("EOD close SHORT: BUY %d %s (accidental short)", abs(qty), sym)
                 closed_short += 1
 
         ib.sleep(3)
-        log.info("EOD close complete — %d longs closed, %d shorts covered",
-                 closed_long, closed_short)
+        log.info(
+            "EOD complete — longs closed=%d  shorts covered=%d  multi-day kept=%d",
+            closed_long, closed_short, skipped_multiday,
+        )
 
     except Exception as e:
         log.error("EOD close failed: %s", e)

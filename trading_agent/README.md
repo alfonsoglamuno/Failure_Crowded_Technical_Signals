@@ -51,23 +51,24 @@ cd trading_agent && pip install -r requirements.txt
 # 2. Configure credentials
 cp .env.example .env    # fill in IBKR_ACCOUNT, ports
 
-# 3. Train all model variants (~3 min)
+# 3. Train all model variants (~5 min, 7yr data)
 python bootstrap_model.py --yfinance
 
-# 4. Start paper trading (interactive variant menu)
-python run_agent.py --paper
+# 4. Start paper trading — uses h1d_both from config (intraday, EOD close)
+python run_agent.py --paper --no-menu
 
-# 5. Skip menu, use specific variant
-python run_agent.py --paper --variant h1d_longonly
+# 5. Emergency: close specific positions manually
+python manage_positions.py --ticker ASML.AS
+python manage_positions.py --eod-close   # flatten everything now
 ```
 
 ```bat
 # Windows shortcuts
 start.bat          # paper trading
-start.bat live     # !! real money — requires confirmation !!
+start.bat live     # !! real money — requires double confirmation !!
 ```
 
-When started with `--live`, the agent shows a full confirmation screen with variant, position size, max loss, and SL/TP before accepting any input.
+When started with `--live`, the agent shows a full disclaimer screen and requires typing `yes` then `confirmed` before any orders are placed.
 
 ---
 
@@ -75,37 +76,48 @@ When started with `--live`, the agent shows a full confirmation screen with vari
 
 Six models across 3 horizons x 2 direction modes. Select with `--variant` or the interactive menu.
 
-| Variant | Hold | Direction | Correlation gate | When to use |
-|---------|------|-----------|-----------------|-------------|
-| **`h1d_longonly`** | **1 day** | **Long-only** | **0.85** | **Default. Intraday, EOD close, no shorts** |
-| `h3d_longonly` | 3 days | Long-only | 0.70 | Swing fades, no shorts |
-| `h5d_longonly` | 5 days | Long-only | 0.65 | Multi-day, no shorts |
-| `h1d_both` | 1 day | Long + Short | 0.85 (direction-adj) | Intraday, allow_short=true required |
-| `h3d_both` | 3 days | Long + Short | 0.70 (direction-adj) | Swing, allow_short=true required |
-| `h5d_both` | 5 days | Long + Short | 0.65 (direction-adj) | Position, allow_short=true required |
+| Variant | Hold | EOD close | SL | TP | Corr gate | When to use |
+|---------|------|-----------|----|----|-----------|-------------|
+| **`h1d_both`** | **intraday** | **YES (16:27)** | **1.5%** | **2.5%** | **0.85** | **Active default. Long-only with allow_short=false** |
+| `h1d_longonly` | intraday | YES (16:27) | 1.5% | 2.5% | 0.85 | Pure long-only training; lower signal count |
+| `h3d_longonly` | 3 days | NO | 2.5% | 4.0% | 0.70 | Swing fades, positions survive overnight |
+| `h5d_longonly` | 5 days | NO | 3.5% | 6.0% | 0.65 | Multi-day positions, wider SL/TP |
+| `h3d_both` | 3 days | NO | 2.5% | 4.0% | 0.70 (dir-adj) | Swing, allow_short=true required |
+| `h5d_both` | 5 days | NO | 3.5% | 6.0% | 0.65 (dir-adj) | Position, allow_short=true required |
 
-**`longonly`**: trained only on bearish/neutral alerts → optimised for FADE→BUY. Training set matches the trades actually taken, giving better calibration for a long-only book.
+**Active variant**: `h1d_both` with `allow_short=false`.
+`both` means the model was trained on all alert directions (more data, better calibration).
+SELL entries are blocked by the executor when `allow_short=false` — only BUY entries execute.
+Closing existing longs (SL/TP/EOD exits) is always allowed regardless of this setting.
 
-**`both`**: trained on all alert directions. Required when `allow_short=true` so the model can also score bullish-alert failures (FADE→SELL). More data, but noisier for long-only decisions.
+**`longonly`**: trained only on bearish/neutral alerts (fewer training samples, slightly lower AUC).
+Better theoretical match for a long-only book but in practice `h1d_both` outperforms with 7yr data.
 
-The variant is set in `configs/config.yaml → model.variant`. The agent menu at startup also allows interactive selection.
+**Hold horizon and EOD behaviour**:
+- h1d: EOD close at 16:27 CET flattens all positions. SL/TP orders use DAY TIF (expire automatically).
+- h3d/h5d: NO EOD close. Positions survive overnight. SL/TP use GTC TIF. Morning check re-evaluates each session.
+
+The variant is set in `configs/config.yaml → model.variant`.
 
 ---
 
 ## Evaluating Model Performance
 
 ```bash
-# From repo root:
-python reports/evaluate_models.py
+# Open the notebook (most complete evaluation):
+notebooks/01_results_overview.ipynb
 
-# Single variant:
-python reports/evaluate_models.py --variant h1d_longonly
+# Or run the standalone script:
+python reports/evaluate_models.py --variant h1d_both
 ```
 
-Results go to `reports/results/`. The script measures AUC, precision/recall at multiple thresholds, break-even analysis, and calibration error on the chronological hold-out split.
+The notebook shows: AUC, precision/recall at multiple thresholds, temporal stability across
+Pre-COVID / COVID / Recovery / Recent windows, feature importance, calibration curves, and break-even analysis.
 
-**Break-even precision** (SL=1.5%, TP=2.5%, commission 0.10% round-trip): ~40%.
-Any threshold where measured precision exceeds this is profitable in expectation.
+**Active model results (h1d_both, 7yr data, chronological 80/20 hold-out)**:
+- AUC = 0.605 | P@0.60 = 67% | P@0.65 = 69%
+- Break-even precision (SL=1.5%, TP=2.5%, commission 0.10% rt): ~40%
+- Temporal stability: P@0.60 improves from 50% (Pre-COVID) to 71% (Recent) — model adapts over time
 
 ---
 
@@ -168,17 +180,28 @@ The `atr_vs_commission` feature (ATR / 0.10% round-trip cost) explicitly models 
 
 ## Risk Parameters
 
-| Parameter | Default | Notes |
-|-----------|---------|-------|
+Shared limits apply to all models. SL/TP and trail settings are **per-horizon** — each model uses values calibrated to its expected hold duration and typical price range (wider for longer holds):
+
+| Parameter | h1d (intraday) | h3d (swing) | h5d (position) |
+|-----------|---------------|-------------|----------------|
+| Stop-loss | 1.5% | 2.5% | 3.5% |
+| Take-profit | 2.5% | 4.0% | 6.0% |
+| Reward/risk | 1.67:1 | 1.60:1 | 1.71:1 |
+| Trail trigger | 1.0% | 1.5% | 2.0% |
+| Trail step | 0.5% | 0.8% | 1.0% |
+| Time exit | 6.5h open | none | none |
+| EOD flatten | YES 16:27 | NO | NO |
+| SL/TP TIF | DAY | GTC | GTC |
+
+| Shared parameter | Value | Notes |
+|-----------------|-------|-------|
 | Capital | 100,000 EUR | Working allocation |
 | Position size | 2% NAV | ~2,000 EUR per trade |
-| Stop-loss | 1.5% | STOXX50 daily ATR ≈ 1.5% |
-| Take-profit | 2.5% | ~1.7:1 reward/risk ratio |
 | Max open positions | 10 | Slot cap |
-| Max daily loss | 300 EUR | 0.3% of capital — stops trading for the day |
-| Commission | 0.05% min 2 EUR | Proportional to trade size |
-| Fade threshold | 0.60 | Active variant default |
-| Allow short | false | Long-only until IBKR short locates confirmed |
+| Max daily loss | 300 EUR | 0.3% of capital |
+| Commission | 0.05% min 2 EUR | IBKR tiered |
+| Fade threshold | 0.60 | Active (h1d_both) |
+| Allow short | false | SELL entries blocked |
 
 ---
 

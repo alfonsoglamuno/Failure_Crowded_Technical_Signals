@@ -12,15 +12,34 @@ log = logging.getLogger(__name__)
 
 
 class RiskManager:
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, horizon_days: int = 1):
         r = cfg["risk"]
-        self.max_daily_loss = r["max_daily_loss_eur"]
+        self.max_daily_loss   = r["max_daily_loss_eur"]
         self.max_position_pct = r["max_position_pct"]
-        self.stop_loss_pct = r["stop_loss_pct"]
-        self.take_profit_pct = r["take_profit_pct"]
-        self.min_trade_eur = r["min_trade_size_eur"]
+        self.min_trade_eur    = r["min_trade_size_eur"]
         self._commission_rate = r.get("commission_rate_pct", 0.05) / 100
         self._commission_min  = r.get("commission_min_eur", 2.0)
+
+        # Per-horizon overrides: h1d / h3d / h5d sections in config take priority
+        # over the top-level defaults. This lets each model type use SL/TP levels
+        # calibrated to its expected hold duration and typical price range.
+        h_key = f"h{horizon_days}d"
+        overrides = r.get(h_key, {})
+        self.stop_loss_pct   = overrides.get("stop_loss_pct",   r["stop_loss_pct"])
+        self.take_profit_pct = overrides.get("take_profit_pct", r["take_profit_pct"])
+        self.horizon_days    = horizon_days
+
+        if overrides:
+            log.info(
+                "RiskManager: horizon=%dd  SL=%.1f%%  TP=%.1f%%  (from h%dd overrides)",
+                horizon_days, self.stop_loss_pct * 100,
+                self.take_profit_pct * 100, horizon_days,
+            )
+        else:
+            log.info(
+                "RiskManager: horizon=%dd  SL=%.1f%%  TP=%.1f%%  (defaults)",
+                horizon_days, self.stop_loss_pct * 100, self.take_profit_pct * 100,
+            )
 
     def estimate_commission(self, trade_value: float) -> float:
         """IBKR tiered: 0.05% of trade value, minimum 2 EUR."""

@@ -151,7 +151,10 @@ def _build_feature_matrix(labeled: pd.DataFrame, feat_panel: pd.DataFrame,
         price_feats.drop_duplicates(["date", "ticker"]),
         on=["date", "ticker"], how="left", suffixes=("", "_feat"),
     )
-    merged = merged.reset_index(drop=True)
+    # !! Critical: sort by date before 80/20 split so early-stop val set is
+    # always FUTURE data. Without this, the split takes the last 20% of the
+    # ticker-sorted merge which spans the entire date range — data leakage.
+    merged = merged.sort_values("date").reset_index(drop=True)
 
     feat_cols = (
         [c for c in merged.columns if c in price_feat_cols]

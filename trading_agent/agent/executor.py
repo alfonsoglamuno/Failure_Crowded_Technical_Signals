@@ -55,6 +55,7 @@ class IBKRExecutor:
         take_profit: float,
         action: str = "",
         contract: Optional[Stock] = None,
+        horizon_days: int = 1,
     ) -> OrderResult:
         """
         Place a bracket order: market entry + stop-loss + take-profit limit.
@@ -62,11 +63,16 @@ class IBKRExecutor:
         Pass a pre-qualified `contract` from run_agent to skip re-lookup and
         benefit from the conId already resolved by qualifyContracts().
         """
-        # ── Hard safety: block short entries unconditionally unless explicitly enabled ──
-        # The agent's design is LONG-only (fading = BUY the dip, not shorting the spike).
-        # Any SELL entry here means a short position — which IBKR may fill but cannot
-        # be borrowed reliably on European stocks. Block it hard so config bugs or
-        # signal inversions cannot accidentally create short positions.
+        # ── SELL entry vs SELL exit — critical distinction ────────────────────────
+        # SELL EXIT  (closing a long): SL/TP/EOD orders. These are child orders of an
+        #   existing bracket and are never passed to place_bracket() — they are placed
+        #   directly by the bracket setup below. ALWAYS allowed.
+        # SELL ENTRY (opening a short): place_bracket() with trade_direction="SELL".
+        #   This is only valid when allow_short=True. When allow_short=False, it is
+        #   BLOCKED here unconditionally regardless of config or signal scoring.
+        #
+        # This function is called ONLY for new position entries. Exit orders for existing
+        # long positions are child orders of the bracket and are not routed through here.
         if trade_direction == "SELL" and not self.allow_short:
             log.error(
                 "BLOCKED short entry for %s — allow_short=False. "
@@ -147,11 +153,19 @@ class IBKRExecutor:
                 raise RuntimeError(f"TWS did not assign an orderId for {yahoo_ticker} parent order")
 
             # ── Step 2: take-profit limit order ──────────────────────────────────────
+            # TIF for exit orders:
+            #   h1d (intraday) → DAY: orders expire at session end automatically.
+            #     If the agent crashes before EOD the orders vanish safely;
+            #     the position is then caught by the overnight handler next morning.
+            #   h3d / h5d (multi-day) → GTC: positions are designed to survive overnight.
+            #     The monitor re-evaluates and adjusts levels each morning.
+            exit_tif = "DAY" if horizon_days == 1 else "GTC"
+
             tp = LimitOrder(ib_exit_action, qty, _tick_round(take_profit))
             tp.parentId = parent_id
             tp.transmit = False
             tp.outsideRth = False
-            tp.tif = "GTC"                 # stay open until hit or manually cancelled
+            tp.tif = exit_tif
             if self.account:
                 tp.account = self.account
 
@@ -160,7 +174,7 @@ class IBKRExecutor:
             sl.parentId = parent_id
             sl.transmit = True
             sl.outsideRth = False
-            sl.tif = "GTC"                 # stay open until hit or manually cancelled
+            sl.tif = exit_tif
             if self.account:
                 sl.account = self.account
 

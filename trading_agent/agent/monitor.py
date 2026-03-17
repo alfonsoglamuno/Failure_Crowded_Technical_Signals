@@ -37,6 +37,9 @@ class PositionMonitor:
         self._commission_rate = commission_rate
         self._commission_min  = commission_min
         self.commission = commission  # legacy fallback when trade value unknown
+        # Track which parent order IDs have already had their TP extended
+        # (extension is applied at most once per position per session)
+        self._tp_extended: set[int] = set()
 
     # ── Exit sync ──────────────────────────────────────────────────────────
 
@@ -103,25 +106,37 @@ class PositionMonitor:
 
     def monitor_positions(self, contracts_cfg: dict, feed, cfg: dict, account: str = ""):
         """
-        Trail stops and enforce time-based exits. Called every 5 minutes.
+        Trail stops, extend TPs, and enforce time-based exits. Called every 5 min.
 
-        Trailing stop logic:
+        Trailing stop:
           Once unrealized gain >= trail_trigger_pct, raise SL to
           (current_price - trail_step_pct). Never lowers SL.
           Effect: locks in break-even at +0.5%, then keeps trailing upward.
 
-        Time exit:
+        TP extension (let winners run):
+          When price reaches >= 75% of the original entry→TP distance, the TP
+          limit order is extended by the full original range (2× total reward).
+          This applies to both intraday (h1d) and multi-day (h3d/h5d) positions.
+          Rationale: Jegadeesh & Titman (1993) momentum — once a reversal is
+          confirmed and running, curtailing it early sacrifices positive EV.
+          Extension is applied at most once per position (tracked by a flag in rec).
+
+        Time exit (h1d only):
           If position has been open > max_hold_hours AND gain is still below
-          half the trail trigger, close flat. Avoids dead-money drag.
+          half the trail trigger, close flat — avoids dead-money drag.
+          Multi-day positions are governed by their SL/TP + morning re-evaluation.
         """
         open_trades = self._get_open_journal_trades()
         if not open_trades:
             log.debug("No open trades to monitor")
             return
 
-        trail_trigger = cfg["risk"].get("trail_trigger_pct", 0.005)
-        trail_step    = cfg["risk"].get("trail_step_pct",    0.003)
-        max_hold_h    = cfg["risk"].get("max_hold_hours",    4.0)
+        # Per-horizon risk lookup — called per-position so a mixed session
+        # (e.g. an h1d and an h3d position open simultaneously) each uses its
+        # own horizon's trail and time-exit settings from config.
+        def _risk(rec: dict, key: str, default: float) -> float:
+            h = rec.get("hold_horizon_days") or 1
+            return cfg["risk"].get(f"h{h}d", {}).get(key, cfg["risk"].get(key, default))
 
         # Fetch active stop orders from IBKR, keyed by parentId.
         # Use orderType == "STP" instead of isinstance(StopOrder) because
@@ -174,11 +189,26 @@ class PositionMonitor:
             log.info("[MONITOR] %s  px=%.4f  entry=%.4f  P&L=%.2f%%  open=%.1fh",
                      ticker, current_px, entry_px, unrealized_pct * 100, hours_open)
 
+            horizon = rec.get("hold_horizon_days") or 1
+            # TIF matches what the bracket was placed with
+            exit_tif = "DAY" if horizon == 1 else "GTC"
+
+            orig_tp = rec.get("take_profit") or 0
+            orig_sl = rec.get("stop_loss")   or 0
+
+            # Original entry→TP range (positive regardless of direction)
+            orig_range = abs(orig_tp - entry_px) if orig_tp and entry_px else 0.0
+
+            # Per-position trail / time-exit params from horizon-specific config
+            trail_trigger = _risk(rec, "trail_trigger_pct", 0.010)
+            trail_step    = _risk(rec, "trail_step_pct",    0.005)
+            max_hold_h    = _risk(rec, "max_hold_hours",    6.5)
+
             # ── Ensure SL exists ──────────────────────────────────────────
             # If position has NO active stop order, re-place one.
-            # This protects naked positions after EOD bracket cancellation or reconnect.
+            # This protects naked positions after bracket cancellation or reconnect.
             if parent_id not in stop_trades:
-                sl_pct = cfg["risk"].get("stop_loss_pct", 0.015)
+                sl_pct = _risk(rec, "stop_loss_pct", 0.015)
                 if direction == "BUY":
                     sl_price = _tick_round(current_px * (1 - sl_pct))
                 else:
@@ -189,15 +219,15 @@ class PositionMonitor:
                 if qty > 0:
                     sl_action = "SELL" if direction == "BUY" else "BUY"
                     sl_order = StopOrder(sl_action, qty, sl_price)
-                    sl_order.tif      = "DAY"
+                    sl_order.tif      = exit_tif   # DAY for h1d, GTC for h3d/h5d
                     sl_order.parentId = parent_id
                     if account:
                         sl_order.account = account
                     try:
                         self.ib.placeOrder(contract, sl_order)
                         log.warning("[SL-RESTORE] %s: re-placed missing SL @ %.4f "
-                                    "(%.1f%% from %.4f)",
-                                    ticker, sl_price, sl_pct * 100, current_px)
+                                    "(%.1f%% from %.4f)  tif=%s",
+                                    ticker, sl_price, sl_pct * 100, current_px, exit_tif)
                     except Exception as e:
                         log.warning("[SL-RESTORE] Failed to re-place SL for %s: %s", ticker, e)
 
@@ -215,7 +245,6 @@ class PositionMonitor:
                     if new_sl != current_sl:
                         sl_trade.order.auxPrice = new_sl
                         try:
-                            # ib_insync: modify by re-submitting with same orderId
                             self.ib.placeOrder(contract, sl_trade.order)
                             log.info("[TRAIL] %s  SL %.4f -> %.4f  (gain +%.2f%%)",
                                      ticker, current_sl, new_sl, unrealized_pct * 100)
@@ -226,8 +255,55 @@ class PositionMonitor:
                 else:
                     log.debug("[TRAIL] %s  no active stop order found (may have filled)", ticker)
 
-            # ── Time exit ─────────────────────────────────────────────────
-            if hours_open >= max_hold_h and unrealized_pct < trail_trigger / 2:
+            # ── TP extension — let winners run ────────────────────────────
+            # When price has reached >= 75% of the original entry→TP range,
+            # extend the TP limit order by another full original range.
+            # Applied at most once per position (flagged via _tp_extended set).
+            # Rationale: momentum continuation — once a reversal is confirmed
+            # and progressing strongly, the expected value of holding increases.
+            if (orig_range > 0 and orig_tp > 0
+                    and parent_id not in self._tp_extended):
+                progress = (
+                    (current_px - entry_px) / orig_range if direction == "BUY"
+                    else (entry_px - current_px) / orig_range
+                )
+                if progress >= 0.75:
+                    # Extend TP by the original range beyond the current TP
+                    if direction == "BUY":
+                        new_tp = _tick_round(orig_tp + orig_range)
+                    else:
+                        new_tp = _tick_round(orig_tp - orig_range)
+
+                    # Find the TP limit order for this bracket
+                    tp_trades = [
+                        t for t in self.ib.trades()
+                        if getattr(t.order, "parentId", 0) == parent_id
+                        and getattr(t.order, "orderType", "") == "LMT"
+                        and t.orderStatus.status not in ("Filled", "Cancelled", "Inactive")
+                    ]
+                    if tp_trades:
+                        tp_trade = tp_trades[0]
+                        tp_trade.order.lmtPrice = new_tp
+                        try:
+                            self.ib.placeOrder(contract, tp_trade.order)
+                            self._tp_extended.add(parent_id)
+                            log.info(
+                                "[TP-EXTEND] %s  progress=%.0f%%  TP %.4f -> %.4f  "
+                                "(+%.1f%% from entry)  horizon=%dd",
+                                ticker, progress * 100, orig_tp, new_tp,
+                                abs(new_tp - entry_px) / entry_px * 100,
+                                horizon,
+                            )
+                        except Exception as e:
+                            log.warning("TP extension failed for %s: %s", ticker, e)
+                    else:
+                        log.debug("[TP-EXTEND] %s  no active TP order found", ticker)
+
+            # ── Time exit (intraday h1d only) ──────────────────────────────
+            # Multi-day positions are governed by their SL/TP and morning re-eval.
+            if (horizon == 1
+                    and hours_open >= max_hold_h
+                    and unrealized_pct < trail_trigger / 2):
                 log.info("[TIME EXIT] %s open %.1fh unrealized %.2f%% — closing flat",
                          ticker, hours_open, unrealized_pct * 100)
                 self._force_exit(rec, contract, current_px, account)
