@@ -5,248 +5,341 @@ Predicts when technical alerts will **fail** and trades the reversal.
 
 > **Instrument scope: cash equities only.**
 > This agent trades **shares (stocks) exclusively** using bracket orders (market entry + limit take-profit + stop-loss).
-> Options, futures, CFDs, and all other derivatives are **not used and not required**. No options trading permissions are needed.
+> Options, futures, CFDs, and all other derivatives are **not used and not required**.
 
 ---
 
 ## How It Works
 
-Every trading day at **09:15 CET**:
+On each scan cycle (every 30 min during market hours):
 
 ```
-IBKR data ──► Alert Detection ──► Feature Engineering ──► XGBoost
-                 (18 signal types)    (53 features)        P(failure)
-                                                               │
-                          P ≥ 0.60 ──► FADE ──► Contrarian bracket order
-                          P ≤ 0.40 ──► FOLLOW ──► Momentum bracket order
-                          between  ──► SKIP
-                                               │
-                                         Journal (SQLite)
-                                               │
-                                         Adaptive Learner
-                                      (recalibrate thresholds,
-                                       retrain model every 2 weeks)
+IBKR data ──► Alert Detection ──► Feature Engineering ──► XGBoost (active variant)
+                 (18 signal types)    (74 features)           P(failure)
+                                                                   │
+                              P ≥ 0.60 ──► FADE ──► Contrarian bracket order
+                              P ≤ 0.40 ──► FOLLOW ──► Momentum bracket order
+                              between  ──► SKIP
+                                                   │
+                                             Journal (SQLite)
+                                                   │
+                                             Adaptive Learner
+                                          (recalibrate thresholds,
+                                           retrain model every 2 weeks)
 ```
 
-### Model Performance (validation set, 3,159 events)
+### Model Performance (h3d_longonly, 2-year validation)
 
-| Decile | P(failure) | Actual Fail % | Action |
-|--------|-----------|---------------|--------|
-| Top 10% | 0.75-0.99 | **82.0%** | FADE |
-| Top 20% | 0.63-0.75 | 62.7% | FADE |
-| Bottom 10% | 0.04-0.26 | 18.6% | FOLLOW |
+| Threshold | Signals | Precision |
+|-----------|---------|-----------|
+| 0.55 | 921 | 71.0% |
+| 0.60 | 757 | **75.0%** ← active |
+| 0.65 | 604 | 79.0% |
+| 0.70 | 495 | 83.4% |
 
-> Break-even needed with 2,000 EUR position: **37.5%**. Model delivers **69.6%** on FADE signals.
+> Break-even with 2,000 EUR position: **37.5%**. Active threshold delivers **75.0%**.
 
 ---
 
 ## Prerequisites
 
-1. **Python 3.10+** — [python.org](https://www.python.org/downloads/)
-2. **IBKR account permissions needed:** stock trading on European exchanges only. **No options permissions required.**
-3. **IB Gateway** — download at:
-   `https://www.interactivebrokers.com/en/trading/ibgateway-stable.html`
-
-   First-time IB Gateway setup:
-   - Log in with your IBKR username and select **Paper Trading** account
-   - Go to **Configure → Settings → API → Enable ActiveX and Socket Clients**
-   - Set **Socket port** to `4002`
-   - Tick **Allow connections from localhost only**
-   - Click **OK** and restart IB Gateway
+1. **Python 3.10+**
+2. **IB Gateway** — paper trading on port 4002, API enabled
+3. **IBKR account** with European stock trading permissions (no options needed)
 
 ---
 
 ## Quick Start
 
-### Step 0 — Configure credentials
-
-Copy `.env.example` to `.env` and fill in your IBKR details:
-
 ```bash
-cp .env.example .env
-```
+# 1. Install dependencies
+cd trading_agent && pip install -r requirements.txt
 
-```ini
-# .env  (gitignored — never commit this)
-IBKR_ACCOUNT=U12345678      # your paper account ID
-IBKR_PAPER_PORT=4002
-IBKR_LIVE_PORT=4001
-```
+# 2. Configure credentials
+cp .env.example .env    # fill in IBKR_ACCOUNT, ports
 
-### Step 1 — Install dependencies
-
-```bat
-cd trading_agent
-python -m venv .venv
-.venv\Scripts\activate          # Windows
-pip install -r requirements.txt
-```
-
-### Step 2 — Bootstrap the model (required before first run)
-
-The model must be trained before the agent can trade. Run once, and again whenever features change:
-
-```bash
-python bootstrap_model.py --yfinance
-```
-
-> **Important:** If new features have been added to `src/features/engineering.py` (e.g. the index correlation features), you must rerun bootstrap to regenerate the feature table with the new columns. The agent will refuse to start if the saved feature list does not match the current feature set.
-
-### Step 3 — Start trading (Windows)
-
-```bat
-start.bat              # scheduled paper trading at 09:15 CET (default)
-start.bat once         # run one cycle right now
-start.bat dashboard    # open live P&L dashboard
-start.bat status       # print quick performance summary
-start.bat live         # !! real money — confirm required !!
-```
-
-### Step 3 — Start trading (Linux / macOS)
-
-```bash
-chmod +x start.sh
-./start.sh             # scheduled paper trading
-./start.sh once        # run one cycle right now
-./start.sh dashboard   # open live P&L dashboard
-./start.sh status      # quick status
-./start.sh live        # !! real money !!
-```
-
-### Manual commands (if you prefer)
-
-```bash
-# Bootstrap model (no IB Gateway needed)
+# 3. Train all model variants (first run ~3 min)
 python bootstrap_model.py --yfinance
 
-# Run one paper trading cycle now
-python run_agent.py --paper --once
-
-# Start scheduled paper trading (09:15 CET weekdays)
+# 4. Start paper trading
 python run_agent.py --paper
+```
 
-# Live P&L dashboard (refreshes every 30s, no IBKR needed)
-python dashboard.py --watch
-
-# Quick status snapshot
-python run_agent.py --status
+```bat
+# Windows shortcuts
+start.bat          # scheduled paper trading
+start.bat once     # one cycle now
+start.bat live     # !! real money !!
 ```
 
 ---
 
-## Dashboard
+## Model Variants
 
+Six models are trained, covering **3 horizons** × **2 direction modes**.
+Select the active variant in `configs/config.yaml → model.variant`.
+
+| Variant | Horizon | Direction Mode | When to Use |
+|---------|---------|----------------|-------------|
+| `h1d_longonly` | 1 day | Long-only | Very short intraday holds, allow_short=false |
+| **`h3d_longonly`** | **3 days** | **Long-only** | **Default — swing fades, allow_short=false** |
+| `h5d_longonly` | 5 days | Long-only | Multi-day holds, allow_short=false |
+| `h1d_both` | 1 day | Both directions | Short-term + allow_short=true |
+| `h3d_both` | 3 days | Both directions | Symmetric long/short, allow_short=true |
+| `h5d_both` | 5 days | Both directions | Position trading, allow_short=true |
+
+### Direction mode explained
+
+- **longonly**: trained only on bearish/neutral alerts — optimised for FADE→BUY entries.
+  Better calibration for long-only books because the training set matches the trades.
+- **both**: trained on all alert directions including bullish alerts.
+  Required when `allow_short=true` because the model must also score SELL-side signals.
+
+### Switching variants
+
+```yaml
+# configs/config.yaml
+model:
+  variant: "h1d_longonly"                                # change this
+  path: "data/model/xgboost_h1d_longonly.joblib"        # update to match
+  feature_cols_path: "data/model/feature_cols_h1d_longonly.json"
 ```
-python dashboard.py             # snapshot
-python dashboard.py --watch     # live refresh every 30s
-python dashboard.py --trades    # include full trade history
-```
 
-Shows:
-- Total P&L, hit rate, profit factor
-- Open positions with entry/SL/TP levels
-- Daily P&L history (last 14 days)
-- Per-alert-type performance breakdown
-- Today's signals with probabilities
+Then restart the agent — no retraining needed (all variants are pre-trained).
+Re-run bootstrap only when `allow_short` mode changes or features are updated.
 
 ---
 
-## Intraday-Only Trading Policy
+## Feature Set (74 features across 8 blocks)
 
-The agent is strictly **intraday**: all positions are closed by end of day. No overnight exposure is taken intentionally.
+The model is trained on features derived from microstructure research principles.
+Below is a description of each block and the design rationale.
 
-### EOD Close (end of session)
-- At market close, the agent cancels all open bracket orders and flattens all positions
-- This covers both long positions and any accidental short positions (buy to cover)
+### Block A — Alert features
+`direction_*`, `alert_name_*`, `n_simultaneous_alerts`
 
-### Overnight Position Recovery (market open)
-- At market open, `_evaluate_overnight_positions()` runs automatically
-- If any positions survived overnight (should not happen under normal operation), the agent:
-  1. Re-places missing stop-loss orders for surviving long positions
-  2. Covers (buys to close) any accidental short positions immediately
-- This acts as a safety net, not normal operating mode
+The alert type and direction are the primary signals. Simultaneous alerts on the same
+ticker amplify the crowding effect — the more signals fire at once, the more attention
+a stock attracts and the more likely the signal is noise rather than real information
+(Barber & Odean, 2008).
 
-### Mid-Session SL Monitoring
-- The monitor checks stop-loss orders throughout the session
-- If an SL order goes missing (e.g. cancelled by IBKR due to margin or connectivity), it is automatically re-placed
-- This prevents positions from being left unprotected
+### Block B — Short-term price state
+`ret_1d/3d/5d/10d/20d`, `dist_ma10/20/50/100/200`, `price_pos_20d`
+
+How overextended is the stock? Momentum and distance from mean-reversion anchors
+(moving averages) are the core "how stretched" features. A stock far from its 50d MA
+on high RSI is a crowded position and a candidate for fade.
+
+### Block C — Volatility state
+`realvol_5d/10d/20d`, `atr_14`, `atr_norm_14`, `candle_range_norm`, `gap_size`,
+`atr_vs_commission`
+
+`atr_vs_commission`: ATR divided by round-trip commission cost (0.10%). A stock with
+ATR >> commission offers room to profit; tight stocks get filtered. The model learns
+that low ATR-to-commission names are high-cost opportunities and penalises them.
+Intraday volatility regime affects the probability of signal success dramatically —
+low-volatility markets give more reliable fades; high-volatility creates continuation.
+
+### Block D — Volume and crowding state
+`vol_zscore_5d/20d`, `ret_vol_interaction`, `consec_up/down`
+
+Volume z-score captures attention surges. The interaction term (|return| × volume z-score)
+is the "crowding intensity" feature — a large move on elevated volume is exactly the
+retail-attention scenario where fades work best.
+
+### Block E — Market regime (index-level)
+`index_ret_1d/5d/20d`, `index_vol_20d`, `index_above_ma50/200`,
+`index_corr_20d/60d`, `beta_20d/60d`, `rel_strength_5d/20d/1d`, `index_regime`
+
+Market regime is the single strongest context variable.
+- `index_above_ma200`: bear vs bull market distinction. Fade signals are more reliable
+  in bear markets where retail longs pile in on every bounce and get stopped out.
+- `index_regime`: +1 bull / 0 neutral / -1 bear based on 20-day index return.
+- `rel_strength_1d/5d/20d`: stock return minus index return. A move that is
+  idiosyncratic (high rel_strength) is more likely to mean-revert than one that
+  is just following the tape.
+- `beta_20d/60d`: how much of the stock's moves are systematic vs idiosyncratic.
+  High-beta names in bear markets fade harder.
+
+### Block F — Calendar / session features
+`dow`, `month`, `is_month_end/start`, `is_week_start/end`
+
+Intraday trading is not stationary through time. Monday openings show institutional
+repositioning; Fridays show position squaring; month-end rebalancing creates
+systematic flows. The model learns to be more or less aggressive at each session type.
+
+### Block G — Inter-stock peer correlation
+`avg_peer_corr_20d`
+
+Average pairwise 20-day return correlation with all other stocks in the EURO STOXX 50
+universe. High value = herding regime where all stocks move together = crowded signals
+are less stock-specific and more likely to be systematic noise. The model uses this to
+discount signals in herded environments and trust them more when stocks are trading
+idiosyncratically.
+
+### Block H — Intraday structure (daily OHLCV proxies)
+`close_vs_range`, `open_to_close_ret`, `gap_pct`, `gap_is_filled`,
+`vwap_distance`, `vol_vs_dow_baseline`, `reversal_intrabar`
+
+These approximate microstructure features without requiring L2/tick data:
+
+- `close_vs_range`: where in today's high-low range did price close? 0 = at low
+  (sellers dominated), 1 = at high (buyers dominated). A bearish alert that closed
+  near the daily high may still have buyers — the fade is weaker.
+- `open_to_close_ret`: signed intraday move (open → close). Separates gap from
+  intraday order-flow direction.
+- `gap_pct`: signed overnight gap. Large gap-downs attract retail bargain-hunting
+  (attention-driven buying); the model weights these differently from trending declines.
+- `gap_is_filled`: 1 if price traded back through the prior close during the session.
+  A filled gap-down is a strong reversal signal (buyers absorbed the selling).
+- `vwap_distance`: close vs (H+L+2C)/4 typical price. Close above VWAP = buyers won
+  the session; below = sellers. Standard institutional benchmark.
+- `vol_vs_dow_baseline`: volume vs 40-session rolling average for the same day-of-week.
+  Approximates "relative volume at this time of day" — a concept from intraday
+  market microstructure (unusually high volume for a Tuesday vs. unusually high
+  volume for a Friday have different implications).
+- `reversal_intrabar`: after a gap-down opening, how much did price recover intraday?
+  A full recovery indicates strong buying absorption; this is the daily OHLCV proxy
+  for order-flow imbalance.
+
+### Why no L2/tick features?
+
+Full order-book imbalance, cancel-to-add ratio, and aggressor-side flow are the
+strongest intraday microstructure predictors (see academic references in the root
+README). However, they require historical L2 data that IBKR does not provide via
+the standard API. The Block H features are the closest daily-OHLCV approximations.
+
+**If you gain access to 1-min or 5-min IBKR bars**, the most valuable additions would be:
+- 1m/5m/15m returns and range (short-horizon momentum)
+- Volume vs same-minute-of-day baseline (true intraday relative volume)
+- Distance to intraday VWAP computed from 1-min bar cumulative (V × P)
+- Opening range breakout/failure (first 30-min high-low)
+- Realized variance from 5-min returns (microstructure-based vol estimate)
 
 ---
 
-## Duplicate Trade Prevention
+## Intraday-Only Policy (no overnight positions)
 
-Two independent guards prevent entering the same stock twice in a session:
+The agent is strictly **intraday**: all positions are closed by EOD.
 
-1. **`already_traded_today`** — blocks re-entry on any ticker that has a `filled` trade with no exit recorded yet in the journal
-2. **`open_ibkr_positions`** — blocks on any non-zero IBKR position (long or short) for that ticker, checked live against the broker
+### Morning check (FIRST at market open)
+Before any new signal scan, `_evaluate_overnight_positions()` runs automatically:
+1. Covers any accidental short positions immediately (MKT BUY)
+2. Re-places missing stop-loss orders for surviving long positions
+3. Reconciles IBKR positions against journal
 
-Both guards must clear before the agent will submit a new bracket order.
+This is a safety net — under normal operation, EOD close handles everything.
+
+### EOD close
+Cancels all bracket orders, then flattens all positions (SELL longs + BUY shorts).
+
+### Mid-session SL guard
+The 5-minute monitor checks for missing SL orders and re-places them automatically.
 
 ---
 
-## Position Management Utility (`close_shorts.py`)
+## Short Safety
 
-`trading_agent/close_shorts.py` is a standalone script for manual position management outside the normal agent cycle. Use it to intervene when needed.
+The agent has two layers of protection against accidental short entries:
 
+1. **Strategy filter** (`filter_signals`): SELL signals are dropped when `allow_short=false`
+2. **Executor hard block** (`place_bracket`): if `trade_direction=="SELL"` reaches the
+   executor and `allow_short=false`, the order is **refused before reaching IBKR**.
+
+SL/TP exit orders (which are also SELL actions) bypass this check because they are
+not entries — they are set as child orders of an existing bracket, not standalone entries.
+
+The `close_shorts.py` utility handles manual intervention if a short appears:
 ```bash
-# Cover specific tickers (buy to close short positions)
-python close_shorts.py --ticker BMW.DE DB1.DE
-
-# Cover all short positions in the account
-python close_shorts.py --shorts-only
-
-# Emergency: close everything (longs and shorts)
-python close_shorts.py --emergency
+python close_shorts.py --shorts-only  # cover all accidental shorts
+python close_shorts.py --emergency    # flatten everything
 ```
-
-By default the script operates on the **paper account**. Add `--live` to act on the live account:
-
-```bash
-python close_shorts.py --shorts-only --live
-```
-
-> Use `--emergency` with caution. It will market-close all open positions regardless of P&L.
 
 ---
 
-## Risk Configuration (`configs/config.yaml`)
+## Correlation Gate
 
-Current settings for trial / paper account:
+Before placing a new trade, the agent checks the 20-day return correlation between
+the candidate and all currently open positions. If the maximum correlation exceeds
+**0.70**, the trade is skipped.
+
+**Why**: two highly correlated positions provide nearly no diversification — you are
+effectively doubling a single bet. The correlation gate prevents portfolio crowding,
+especially during sector-wide rotations where multiple stocks may fire alerts
+simultaneously (and all be subject to the same macro driver).
+
+---
+
+## Commission Model
+
+Commissions are calculated proportionally: **0.05% of trade value, minimum 2 EUR**.
+
+This reflects IBKR's tiered pricing for European equities. The flat `commission_per_trade_eur`
+config value is only used as a fallback when trade value is unknown (e.g. pre-fill estimates).
+
+| Trade value | Est. commission (per side) |
+|-------------|---------------------------|
+| 500 EUR | 2.00 EUR (minimum) |
+| 2,000 EUR | 2.00 EUR (minimum) |
+| 5,000 EUR | 2.50 EUR |
+| 10,000 EUR | 5.00 EUR |
+| 20,000 EUR | 10.00 EUR |
+
+The `expected_gross < 2 × commission` check in `risk.py` uses the proportional estimate,
+so illiquid or tiny trades are correctly rejected without blocking normally-sized ones.
+
+Actual IBKR commission from `commissionReport` fills is always preferred over estimates
+when available.
+
+---
+
+## Risk Configuration
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
-| Capital | 100,000 EUR | Working allocation from paper account |
+| Capital | 100,000 EUR | Working allocation |
 | Position size | 2% NAV | ~2,000 EUR per trade |
-| Stop-loss | 2% | |
-| Take-profit | 4% | 2:1 risk/reward |
-| Max trades/day | 5 | FADE both long and short |
-| Commission | actual fill | Uses IBKR execution fill data; falls back to config estimate when unavailable |
-| Commission (est.) | 5 EUR | Fallback: 0.05% × 2,000 EUR × 2 = ~2 EUR + exchange fees |
+| Stop-loss | 1.5% | STOXX50 daily ATR ≈ 1.5% |
+| Take-profit | 2.5% | 5:3 risk/reward |
+| Max open positions | 10 | Slot cap |
+| Commission | 0.05% min 2€ | Proportional to trade size |
 | Max daily loss | 300 EUR | 0.3% of capital |
-| Fade threshold | 0.60 | P(failure) ≥ 0.60 → trade |
+| Fade threshold | 0.60 | Active variant default |
 | Follow disabled | true | Enable after 50+ FADE trades |
-
-Break-even: **37.5% hit rate** needed. Model delivers **69.6%** on FADE signals.
-
-### Commission Tracking
-
-Commissions are recorded from **actual IBKR execution fills** when available. This gives accurate cost accounting without relying on estimates. When fill data does not include commission detail (e.g. certain order types or connectivity gaps), the agent falls back to the `commission_estimate` value in `config.yaml`. Check the journal to verify which method was used for each trade.
+| Allow short | false | Long-only until short locates confirmed |
 
 ---
 
-## The Adaptive Learner
-
-The agent continuously learns from outcomes:
+## Adaptive Learner
 
 ### Fast loop (every 10 trades)
-- If FADE win rate drops below 50% → raise `fade_threshold` (be more selective)
-- If FADE win rate exceeds 65% → lower `fade_threshold` (take more trades)
-- Per-alert-type breakdown logged to identify which alerts work best
+- Win rate < 50% → raise `fade_threshold` (more selective)
+- Win rate > 65% → lower `fade_threshold` (take more trades)
 
 ### Slow loop (every 14 days)
-- Full XGBoost retrain on all live-traded data
-- Model literally learns from its own trading outcomes
-- Learner state persisted in `data/model/learner_state.json`
+- Full XGBoost retrain on live-traded outcomes
+- Uses the currently active model variant
+
+---
+
+## Bootstrap / Retrain
+
+```bash
+# Train all 6 variants (recommended — ~3 min)
+python bootstrap_model.py --yfinance
+
+# Train one specific variant
+python bootstrap_model.py --yfinance --variant h1d_longonly
+
+# Use IBKR data instead of yfinance
+python bootstrap_model.py --paper
+```
+
+Run bootstrap again after:
+- Adding or changing features in `src/features/engineering.py`
+- Changing `history_days` in config (clears cache automatically)
+- Adding new tickers to the universe
+- Enabling/disabling short trading (mode change)
 
 ---
 
@@ -254,112 +347,40 @@ The agent continuously learns from outcomes:
 
 ```
 trading_agent/
-├── start.bat               ← Windows launch script
-├── start.sh                ← Linux/Mac launch script
-├── run_agent.py            ← Main agent entry point
-├── bootstrap_model.py      ← One-time model training
-├── dashboard.py            ← Live P&L monitor
-├── close_shorts.py         ← Manual position management utility
-├── .env                    ← IBKR credentials (gitignored)
+├── run_agent.py            ← Main agent loop
+├── bootstrap_model.py      ← Trains all 6 model variants
+├── dashboard.py            ← Live P&L dashboard
+├── close_shorts.py         ← Manual position management
 ├── configs/
-│   ├── config.yaml         ← All settings
+│   ├── config.yaml         ← All settings (including model.variant)
 │   └── ibkr_contracts.yaml ← EURO STOXX 50 symbol mappings
 ├── agent/
 │   ├── alerts.py           ← 18 technical signal detectors
-│   ├── features.py         ← 53-feature vector builder
+│   ├── features.py         ← 74-feature vector builder (live)
 │   ├── model.py            ← XGBoost loader/predictor
-│   ├── strategy.py         ← FADE / FOLLOW / SKIP logic
-│   ├── risk.py             ← Position sizing, daily limits
-│   ├── executor.py         ← IBKR bracket orders
+│   ├── strategy.py         ← FADE / FOLLOW / SKIP logic + crowding gate
+│   ├── risk.py             ← Position sizing, commission model, daily limits
+│   ├── executor.py         ← IBKR bracket orders + short safety block
 │   ├── journal.py          ← SQLite trade log
-│   ├── learner.py          ← Threshold recalibration + retrain
-│   ├── monitor.py          ← Detects closed bracket orders, re-places missing SL orders
+│   ├── learner.py          ← Threshold recalibration + periodic retrain
+│   ├── monitor.py          ← Exit sync, trailing SL, SL re-placement
 │   └── data_feed.py        ← IBKR connection + OHLCV fetch
 └── data/
-    ├── model/              ← Trained model + feature list (gitignored)
+    ├── model/              ← 6 trained model files (gitignored)
     ├── cache/              ← OHLCV parquet cache (gitignored)
     └── journal.db          ← Trade database (gitignored)
 ```
 
 ---
 
-## Decision Logic
-
-| P(failure) | Action | Trade direction |
-|-----------|--------|----------------|
-| ≥ 0.60 | **FADE** | Opposite of alert (fade the crowd) |
-| 0.40-0.60 | **SKIP** | No trade — model uncertain |
-| ≤ 0.40 | **FOLLOW** | Same as alert (disabled by default) |
-
-**FADE examples:**
-- Bullish alert (e.g. RSI overbought) + P(failure)=0.75 → **SELL** (expect reversal)
-- Bearish alert (e.g. break below 50d MA) + P(failure)=0.82 → **BUY** (expect bounce)
-
----
-
-## Cron Automation (Linux/Mac)
-
-```bash
-crontab -e
-# Add (adjust path):
-15 9 * * 1-5 cd /path/to/trading_agent && .venv/bin/python run_agent.py --paper >> data/cron.log 2>&1
-```
-
----
-
 ## Troubleshooting
 
-**"Model not found"**
-```bash
-python bootstrap_model.py --yfinance
-```
+**"Model not found"** → `python bootstrap_model.py --yfinance`
 
-**"Feature mismatch" or model refuses to load**
+**"Feature mismatch"** → features changed; rerun bootstrap
 
-New features were added (e.g. index correlation features). Rerun bootstrap to retrain on the updated feature set:
-```bash
-cd trading_agent
-python bootstrap_model.py --yfinance
-```
+**Accidental shorts** → `python close_shorts.py --shorts-only`
 
-**"Could not connect to IB Gateway"**
-- Make sure IB Gateway is open and you're logged into your paper account
-- Check API is enabled on port 4002
-- If firewall blocks it: Add IB Gateway to Windows Firewall exceptions
+**Flatten everything** → `python close_shorts.py --emergency`
 
-**"No alerts today"**
-- Normal — some days have no qualifying signals
-- Agent logs this and exits cleanly
-
-**Accidental short position left open**
-```bash
-python close_shorts.py --shorts-only
-```
-
-**Need to flatten everything immediately**
-```bash
-python close_shorts.py --emergency
-```
-
-**Check the log**
-```bash
-type data\agent.log     # Windows
-tail -f data/agent.log  # Linux/Mac
-```
-
----
-
-## Go Live
-
-After 2-4 weeks of paper trading with satisfactory results:
-
-1. Switch IB Gateway to **Live** account
-2. Verify funds and permissions for **European stock trading** (no options permissions needed)
-3. Run: `start.bat live` (will ask for confirmation)
-
-Required IBKR permissions for live:
-- Trading permissions: **Stocks** on European exchanges (XETRA, Euronext, LSE, etc.)
-- Market data: European equities delayed or real-time
-- **Options trading is not used — do not enable it**
-
-> Strongly recommended: maintain paper trading alongside live for comparison.
+**Check logs** → `type data\agent.log` (Windows) or `tail -f data/agent.log`

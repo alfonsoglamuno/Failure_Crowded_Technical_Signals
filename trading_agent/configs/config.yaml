@@ -60,11 +60,18 @@ strategy:
   regime_threshold_boost: 0.05
 
 model:
-  path: "data/model/xgboost_h3d.joblib"
-  feature_cols_path: "data/model/feature_cols.json"
+  # Active model variant. Format: h{horizon}d_{mode}
+  #   horizon : 1d (intraday focus) | 3d (swing default) | 5d (position)
+  #   mode    : longonly (BUY entries only) | both (BUY + SELL, requires allow_short=true)
+  # After running bootstrap_model.py, set this to choose which model the agent uses.
+  variant: "h3d_longonly"
+  # Paths are derived from variant — change variant above, not paths below.
+  path: "data/model/xgboost_h3d_longonly.joblib"
+  feature_cols_path: "data/model/feature_cols_h3d_longonly.json"
   min_history_days: 252
 
   # Learning loop — optimised for active paper trading (5 trades/day → fast feedback)
+  max_hold_days: 3                    # Close multi-day losing positions after this many days
   retrain_frequency_days: 14          # Full retrain every 2 weeks
   min_trades_for_recalibration: 10    # Recalibrate after 10 completed trades
   threshold_step_up: 0.02             # Tighten threshold when losing

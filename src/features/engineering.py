@@ -174,10 +174,85 @@ def add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
     dt = pd.to_datetime(df.index).normalize()
     if dt.tz is not None:
         dt = dt.tz_localize(None)
-    df["dow"]           = dt.dayofweek
-    df["month"]         = dt.month
-    df["is_month_end"]  = dt.is_month_end.astype(int)
+    df["dow"]            = dt.dayofweek
+    df["month"]          = dt.month
+    df["is_month_end"]   = dt.is_month_end.astype(int)
     df["is_month_start"] = dt.is_month_start.astype(int)
+    # Session bucket: open (Mon-Tue morning) vs midday vs close (Thu-Fri)
+    # Proxy for intraday regime — EOM/BOW have higher institutional flow
+    df["is_week_start"]  = (dt.dayofweek == 0).astype(int)   # Monday
+    df["is_week_end"]    = (dt.dayofweek == 4).astype(int)   # Friday
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Block H — intraday structure proxies from daily OHLCV
+# ---------------------------------------------------------------------------
+# These approximate microstructure signals without requiring tick/L2 data.
+# Research shows: close-vs-range, open-to-close direction, gap/overnight drift,
+# and relative volume by session are highly informative for intraday reversals.
+# ---------------------------------------------------------------------------
+
+def add_intraday_structure_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Intraday structure proxies computable from daily OHLCV.
+
+    Features:
+      close_vs_range       — 0=closed at low, 1=closed at high (order-flow proxy)
+      open_to_close_ret    — signed intraday move (open → close)
+      gap_pct              — signed overnight gap vs prior close
+      gap_is_filled        — 1 if price moved back through the gap during the day
+      vwap_distance        — (close - typical_price) / typical_price,
+                             typical_price = (H+L+2C)/4
+      vol_vs_dow_baseline  — volume vs 8-week same-day-of-week rolling average
+                             (rough "relative volume at this time of day" proxy)
+      rel_strength_1d      — 1-day return minus same-day sector/index return
+                             (residualized move after controlling for macro)
+      reversal_intrabar    — recovery fraction after a gap-down opening
+                             (how much of the morning gap was recovered intraday)
+    """
+    daily_range = (df["high"] - df["low"]).replace(0, np.nan)
+
+    # Where did price close within today's range? 0 = at low, 1 = at high.
+    df["close_vs_range"] = (df["close"] - df["low"]) / daily_range
+
+    # Signed intraday return: positive = buyers won the session.
+    df["open_to_close_ret"] = (df["close"] - df["open"]) / df["open"].replace(0, np.nan)
+
+    # Overnight gap: signed pct from yesterday's close to today's open.
+    df["gap_pct"] = (df["open"] - df["close"].shift(1)) / df["close"].shift(1)
+
+    # Gap fill: did price trade back through the gap level during the day?
+    prior_close = df["close"].shift(1)
+    gap_up   = df["open"] > prior_close
+    gap_down = df["open"] < prior_close
+    df["gap_is_filled"] = np.where(
+        gap_up,   (df["low"]  <= prior_close).astype(float),
+        np.where(
+            gap_down, (df["high"] >= prior_close).astype(float),
+            0.0
+        )
+    )
+
+    # VWAP proxy: typical price = (H + L + 2C) / 4
+    # Close above typical price = buyers held into the close.
+    typical_px = (df["high"] + df["low"] + 2 * df["close"]) / 4
+    df["vwap_distance"] = (df["close"] - typical_px) / typical_px.replace(0, np.nan)
+
+    # Relative volume vs same-day-of-week rolling baseline (40 sessions ≈ 8 weeks).
+    # Approximates "is today's volume unusual for this time of day?"
+    vol_baseline = df["volume"].rolling(40, min_periods=10).mean()
+    df["vol_vs_dow_baseline"] = df["volume"] / vol_baseline.replace(0, np.nan)
+
+    # Reversal intrabar: after a gap-down, how much did price recover?
+    # Positive = gap-down that recovered → buying pressure absorbed selling.
+    gap_down_mag = (-df["gap_pct"]).clip(lower=0)   # only gap-downs
+    df["reversal_intrabar"] = np.where(
+        gap_down_mag > 0,
+        df["open_to_close_ret"] / gap_down_mag.replace(0, np.nan),
+        0.0,
+    )
+
     return df
 
 
@@ -282,9 +357,13 @@ def build_features(
         grp = add_volatility_regime(grp)
         grp = add_volume_features(grp, list(volume_windows))
         grp = add_calendar_features(grp)
+        grp = add_intraday_structure_features(grp)
 
         if index_close is not None:
             grp = add_regime_features(grp, index_close)
+            # 1-day residualized move: stock return minus index return
+            idx = _align_index(index_close, grp.index)
+            grp["rel_strength_1d"] = grp["close"].pct_change(1) - idx.pct_change(1)
 
         grp["ticker"] = ticker
         frames.append(grp.reset_index())

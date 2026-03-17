@@ -2,14 +2,26 @@
 Trading agent main entry point.
 
 Usage:
-    python run_agent.py --paper          # paper trading (recommended first)
-    python run_agent.py --live           # live trading (use with caution)
-    python run_agent.py --status         # print journal summary, no trading
-    python run_agent.py --paper --once   # run once now, don't loop
+    python run_agent.py --paper                      # interactive variant selection + paper trading
+    python run_agent.py --paper --variant h3d_longonly  # skip menu, use specific variant
+    python run_agent.py --live                       # live trading (confirm required)
+    python run_agent.py --status                     # print journal summary, no trading
+    python run_agent.py --paper --once               # run one cycle now
 
-Continuous intraday mode (default):
-    Scans every scan_interval_min minutes during market hours, closes all
-    positions at eod_close_time CET.  Press Ctrl+C to stop.
+Model variants (horizon × direction mode):
+    h1d_longonly   1-day hold, BUY-only (fastest intraday fades)
+    h3d_longonly   3-day hold, BUY-only  ← default
+    h5d_longonly   5-day hold, BUY-only
+    h1d_both       1-day hold, BUY+SELL  (allow_short=true required)
+    h3d_both       3-day hold, BUY+SELL
+    h5d_both       5-day hold, BUY+SELL
+
+Continuous intraday loop:
+    - Fast cycle (5 min):  trail stops, time exits, exit sync
+    - Slow cycle (30 min): full signal scan, new trades
+    - EOD close at 16:30 CET: cancel all brackets, flatten positions
+    - Morning check: re-evaluate any overnight positions FIRST
+    - Reconnect recovery: on IBKR reconnect, reconcile positions before resuming
 """
 
 import argparse
@@ -83,6 +95,146 @@ def _max_corr_with_open(candidate: str, open_tickers: set[str],
     return max_corr
 
 
+# ── Model variant helpers ─────────────────────────────────────────────────────
+
+_VARIANTS = [
+    ("h1d_longonly", "1-day hold, BUY-only  — fastest intraday fades"),
+    ("h3d_longonly", "3-day hold, BUY-only  — standard swing fades [default]"),
+    ("h5d_longonly", "5-day hold, BUY-only  — multi-day positions"),
+    ("h1d_both",     "1-day hold, BUY+SELL  — requires allow_short=true"),
+    ("h3d_both",     "3-day hold, BUY+SELL  — requires allow_short=true"),
+    ("h5d_both",     "5-day hold, BUY+SELL  — requires allow_short=true"),
+]
+
+
+def _variant_paths(model_dir: Path, variant: str) -> tuple[Path, Path]:
+    return (
+        model_dir / f"xgboost_{variant}.joblib",
+        model_dir / f"feature_cols_{variant}.json",
+    )
+
+
+def _apply_variant(cfg: dict, variant: str) -> None:
+    """Rewrite model paths in cfg based on variant name. Exits if not found."""
+    model_dir = Path(cfg["model"]["path"]).parent
+    model_path, cols_path = _variant_paths(model_dir, variant)
+    if not model_path.exists():
+        log.error(
+            "Variant '%s' not found at %s\n"
+            "  Run: python bootstrap_model.py --yfinance --variant %s",
+            variant, model_path, variant,
+        )
+        sys.exit(1)
+    cfg["model"]["variant"]            = variant
+    cfg["model"]["path"]               = str(model_path)
+    cfg["model"]["feature_cols_path"]  = str(cols_path)
+    log.info("Active model variant: %s", variant)
+
+
+def _choose_variant_interactive(cfg: dict) -> str:
+    """
+    Interactive startup menu — shown when --variant is not passed and stdin
+    is a terminal.  Returns the chosen variant name.
+    """
+    import sys as _sys
+    model_dir = Path(cfg["model"]["path"]).parent
+    current   = cfg["model"].get("variant", "h3d_longonly")
+
+    print("\n" + "=" * 64)
+    print("  TRADING AGENT — SELECT MODEL VARIANT")
+    print("=" * 64)
+    for i, (name, desc) in enumerate(_VARIANTS, 1):
+        mp, _ = _variant_paths(model_dir, name)
+        avail  = "ready " if mp.exists() else "MISSING"
+        marker = " ← current" if name == current else ""
+        print(f"  {i}. [{avail}]  {name:<20s}  {desc}{marker}")
+    print(f"  0. Keep current config ({current})")
+    print()
+
+    while True:
+        try:
+            raw = input(f"Choose variant [0-{len(_VARIANTS)}] (Enter = keep current): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return current
+        if raw == "" or raw == "0":
+            return current
+        if raw.isdigit() and 1 <= int(raw) <= len(_VARIANTS):
+            choice = _VARIANTS[int(raw) - 1][0]
+            mp, _ = _variant_paths(model_dir, choice)
+            if not mp.exists():
+                print(f"  Not trained yet. Run: python bootstrap_model.py --yfinance --variant {choice}")
+                continue
+            return choice
+        # Accept variant name typed directly
+        if any(raw == v for v, _ in _VARIANTS):
+            mp, _ = _variant_paths(model_dir, raw)
+            if mp.exists():
+                return raw
+            print(f"  Not trained yet.")
+        else:
+            print("  Invalid choice.")
+
+
+# ── Reconnection recovery ─────────────────────────────────────────────────────
+
+def _reconnect_evaluate(paper: bool, cfg: dict) -> None:
+    """
+    Called once after the agent reconnects to IBKR following a connection loss.
+
+    Steps:
+      1. Sync exits — reconcile any TP/SL fills that happened during the outage.
+      2. Position health check — ensure every open position has a valid SL order.
+      3. Log the outcome for each position so the next scan has accurate context.
+
+    This does NOT place new trades.  It only brings the agent's state back into
+    sync with reality after an uncontrolled disconnect.
+    """
+    from agent.data_feed import IBKRFeed, load_contracts
+    from agent.journal import Journal
+    from agent.model import FailurePredictor
+    from agent.learner import AdaptiveLearner
+    from agent.monitor import PositionMonitor
+
+    log.warning("=== RECONNECT: syncing positions after connection loss ===")
+
+    journal       = Journal(cfg["journal"]["db_path"])
+    contracts_cfg = load_contracts(cfg["universe"]["ibkr_contracts_file"])
+    predictor     = FailurePredictor(
+        model_path=cfg["model"]["path"],
+        feature_cols_path=cfg["model"]["feature_cols_path"],
+    )
+    predictor.load()
+    learner = AdaptiveLearner(cfg, journal, predictor)
+
+    feed = IBKRFeed(cfg, paper=paper)
+    try:
+        feed.connect()
+        monitor = PositionMonitor(
+            feed.ib, journal, learner,
+            commission=cfg["risk"]["commission_per_trade_eur"],
+            commission_rate=cfg["risk"].get("commission_rate_pct", 0.05) / 100,
+            commission_min=cfg["risk"].get("commission_min_eur", 2.0),
+        )
+        # Step 1: catch any fills that arrived while we were offline
+        monitor.check_exits()
+        log.info("Reconnect: exit sync complete")
+
+        # Step 2: SL health check + trail any eligible positions
+        monitor.monitor_positions(
+            contracts_cfg=contracts_cfg,
+            feed=feed,
+            cfg=cfg,
+            account=feed.account_id,
+        )
+        log.info("Reconnect: position health check complete")
+
+    except Exception as e:
+        log.error("Reconnect evaluation failed: %s", e)
+    finally:
+        feed.disconnect()
+    log.warning("=== RECONNECT: sync complete — resuming normal operation ===")
+
+
 def is_market_open(now: datetime | None = None) -> bool:
     """Returns True if we are inside European market hours on a weekday."""
     t = (now or datetime.now(CET)).astimezone(CET)
@@ -120,7 +272,7 @@ def print_status(journal):
     print("Recent signals:")
     for s in journal.get_recent_signals(5):
         print(f"  {s['date']} {s['ticker']:10s} {s['alert_name']:25s} "
-              f"P={s['failure_proba']:.3f} → {s['action']}")
+              f"P={s['failure_proba']:.3f}  {s['action']}")
     print("="*50 + "\n")
 
 
@@ -562,21 +714,28 @@ def _monitor_open_positions(paper: bool, cfg: dict):
 
 def _evaluate_overnight_positions(paper: bool, cfg: dict):
     """
-    Run once at market open if journal has positions from previous session.
+    Run once at market open for any positions carried over from a previous session.
 
-    For each overnight position:
-      1. Check if it's still valid in IBKR (position > 0).
-      2. Ensure a stop-loss order exists at a sensible level.
-         If SL is missing (e.g. bracket cancelled by EOD), re-place it.
-      3. Log a warning for accidental short positions (should be covered).
+    Decision logic for each position:
+      1. IBKR shows 0 qty  → already closed; check_exits will reconcile journal.
+      2. Accidental SHORT   → cover immediately (MKT BUY).
+      3. Price < original SL (gap-through-SL)
+                            → close immediately; SL was bypassed overnight.
+      4. Held > max_hold_days and still at a loss
+                            → close; thesis is stale.
+      5. SL missing + position is in profit (≥ 50% of TP distance)
+                            → re-place SL at break-even (locks in gain).
+      6. SL missing + small profit or loss (within original SL)
+                            → re-place SL at original SL level (respect initial risk).
+      7. SL active          → log current state; no action needed.
 
-    This does NOT make trading decisions — it just protects open positions
-    until the first full signal scan runs and can evaluate them properly.
+    This runs BEFORE any new signal scan so position inventory is accurate.
     """
     from agent.data_feed import IBKRFeed, load_contracts
     from agent.journal import Journal
-    from ib_insync import Stock, StopOrder
+    from ib_insync import Stock, StopOrder, MarketOrder
     from datetime import date
+    import pandas as pd
 
     journal = Journal(cfg["journal"]["db_path"])
     today = date.today()
@@ -585,13 +744,17 @@ def _evaluate_overnight_positions(paper: bool, cfg: dict):
         t for t in journal.get_recent_trades(50)
         if t.get("status") in ("submitted", "filled")
         and t.get("exit_price") is None
-        and str(t.get("date", "")) != str(today)   # from previous day
+        and str(t.get("date", "")) != str(today)   # from a previous day
     ]
     if not open_trades:
         return
 
-    log.warning("Found %d overnight positions from previous session — evaluating", len(open_trades))
+    log.warning("Found %d overnight position(s) from previous session — evaluating", len(open_trades))
     contracts_cfg = load_contracts(cfg["universe"]["ibkr_contracts_file"])
+
+    sl_pct      = cfg["risk"].get("stop_loss_pct", 0.015)
+    tp_pct      = cfg["risk"].get("take_profit_pct", 0.025)
+    max_hold_d  = cfg["model"].get("max_hold_days", 3)
 
     feed = IBKRFeed(cfg, paper=paper)
     try:
@@ -600,13 +763,8 @@ def _evaluate_overnight_positions(paper: bool, cfg: dict):
         ib.sleep(2)
         account = feed.account_id
 
-        # Map IBKR symbol → current position qty
-        ibkr_positions = {
-            pos.contract.symbol: pos.position
-            for pos in ib.positions()
-        }
+        ibkr_positions = {pos.contract.symbol: pos.position for pos in ib.positions()}
 
-        # Existing SL orders keyed by parentId
         ib.reqAllOpenOrders()
         ib.sleep(1)
         existing_stops = {
@@ -617,63 +775,131 @@ def _evaluate_overnight_positions(paper: bool, cfg: dict):
             and t.orderStatus.status not in ("Filled", "Cancelled", "Inactive")
         }
 
-        sl_pct = cfg["risk"].get("stop_loss_pct", 0.015)
-
         for rec in open_trades:
             ticker    = rec.get("ticker", "")
             symbol    = rec.get("ibkr_symbol", "")
             parent_id = rec.get("ibkr_order_id")
             direction = rec.get("trade_direction", "BUY")
             qty       = int(rec.get("quantity", 0))
-            entry_px  = rec.get("entry_price", 0)
+            entry_px  = float(rec.get("entry_price") or 0)
+            orig_sl   = float(rec.get("stop_loss") or 0)
+            orig_tp   = float(rec.get("take_profit") or 0)
+
+            # How many days has this been held?
+            try:
+                entry_date = pd.to_datetime(rec.get("date", today)).date()
+                days_held  = (today - entry_date).days
+            except Exception:
+                days_held = 1
 
             ibkr_qty = ibkr_positions.get(symbol, 0)
 
+            # ── Case 1: already closed in IBKR ────────────────────────────
             if ibkr_qty == 0:
-                # Position already closed in IBKR but journal not updated — will be
-                # reconciled by check_exits; nothing to do here
-                log.info("Overnight %s: IBKR shows 0 position — check_exits will reconcile", ticker)
+                log.info("Overnight %s: IBKR position = 0 — check_exits will reconcile", ticker)
                 continue
 
+            # ── Case 2: accidental short ───────────────────────────────────
             if ibkr_qty < 0:
-                log.warning("Overnight %s: accidental SHORT (%d shares) — covering at open", ticker, ibkr_qty)
+                log.warning("Overnight %s: accidental SHORT %d shares — covering at open", ticker, ibkr_qty)
                 spec = contracts_cfg.get(ticker)
                 if spec:
                     contract = Stock(spec["symbol"], "SMART", spec["currency"])
-                    from ib_insync import MarketOrder
                     order = MarketOrder("BUY", abs(ibkr_qty))
                     order.account = account
                     order.tif = "DAY"
                     ib.placeOrder(contract, order)
                 continue
 
-            # Check SL
-            if parent_id in existing_stops:
-                log.info("Overnight %s: SL already active @ %.4f", ticker, existing_stops[parent_id])
-                continue
-
-            # SL missing — re-place at current price - SL%
             spec = contracts_cfg.get(ticker)
             if not spec:
-                log.warning("Overnight %s: no contract spec — cannot re-place SL", ticker)
+                log.warning("Overnight %s: no contract spec — skipping", ticker)
                 continue
-
             contract = Stock(spec["symbol"], "SMART", spec["currency"])
             current_px = feed.get_latest_price(contract, fallback_price=entry_px)
 
+            # P&L assessment
             if direction == "BUY":
-                sl_price = round(current_px * (1 - sl_pct), 2)
+                profit_pct = (current_px - entry_px) / entry_px if entry_px else 0
+                tp_dist    = (orig_tp - entry_px) / entry_px if orig_tp and entry_px else tp_pct
+            else:
+                profit_pct = (entry_px - current_px) / entry_px if entry_px else 0
+                tp_dist    = (entry_px - orig_tp) / entry_px if orig_tp and entry_px else tp_pct
+
+            # ── Case 3: gap-through-SL ─────────────────────────────────────
+            # SL was bypassed by the overnight gap — original risk exceeded.
+            gap_through_sl = (
+                direction == "BUY"  and orig_sl > 0 and current_px < orig_sl
+            ) or (
+                direction == "SELL" and orig_sl > 0 and current_px > orig_sl
+            )
+            if gap_through_sl:
+                log.warning(
+                    "Overnight %s: price %.4f bypassed original SL %.4f (P&L=%.1f%%) "
+                    "— closing at open [gap-through-SL]",
+                    ticker, current_px, orig_sl, profit_pct * 100,
+                )
+                exit_action = "SELL" if direction == "BUY" else "BUY"
+                order = MarketOrder(exit_action, qty)
+                order.account = account
+                order.tif = "DAY"
+                ib.placeOrder(contract, order)
+                continue
+
+            # ── Case 4: stale thesis — held too long and still losing ──────
+            if days_held > max_hold_d and profit_pct <= 0:
+                log.warning(
+                    "Overnight %s: held %d days, P&L=%.1f%% — "
+                    "closing (thesis stale, max_hold_days=%d)",
+                    ticker, days_held, profit_pct * 100, max_hold_d,
+                )
+                exit_action = "SELL" if direction == "BUY" else "BUY"
+                order = MarketOrder(exit_action, qty)
+                order.account = account
+                order.tif = "DAY"
+                ib.placeOrder(contract, order)
+                continue
+
+            # ── Case 5 & 6: SL active — just log ──────────────────────────
+            if parent_id in existing_stops:
+                log.info(
+                    "Overnight %s: SL active @ %.4f  P&L=%.1f%%  held=%dd",
+                    ticker, existing_stops[parent_id], profit_pct * 100, days_held,
+                )
+                continue
+
+            # ── No active SL — re-place with smart level ───────────────────
+            if direction == "BUY":
+                if profit_pct >= tp_dist * 0.5:
+                    # At least halfway to TP: lock in profit at break-even or better
+                    sl_price = round(max(entry_px, current_px * (1 - sl_pct)), 4)
+                    sl_reason = f"break-even lock (P&L=+{profit_pct:.1%})"
+                elif profit_pct > 0:
+                    # Small profit: normal SL from current price
+                    sl_price  = round(current_px * (1 - sl_pct), 4)
+                    sl_reason = f"normal from current (P&L=+{profit_pct:.1%})"
+                else:
+                    # At a loss: restore to original SL level (respect initial risk)
+                    sl_price  = round(max(orig_sl, current_px * (1 - sl_pct)), 4) if orig_sl else round(current_px * (1 - sl_pct), 4)
+                    sl_reason = f"original level (P&L={profit_pct:.1%})"
                 sl_order = StopOrder("SELL", qty, sl_price)
             else:
-                sl_price = round(current_px * (1 + sl_pct), 2)
+                if profit_pct >= tp_dist * 0.5:
+                    sl_price  = round(min(entry_px, current_px * (1 + sl_pct)), 4)
+                    sl_reason = f"break-even lock (P&L=+{profit_pct:.1%})"
+                else:
+                    sl_price  = round(current_px * (1 + sl_pct), 4)
+                    sl_reason = f"normal from current (P&L={profit_pct:.1%})"
                 sl_order = StopOrder("BUY", qty, sl_price)
 
             sl_order.account  = account
             sl_order.tif      = "DAY"
             sl_order.parentId = parent_id
             ib.placeOrder(contract, sl_order)
-            log.warning("Overnight %s: re-placed SL @ %.4f (%.1f%% from %.4f)",
-                        ticker, sl_price, sl_pct * 100, current_px)
+            log.warning(
+                "Overnight %s: SL re-placed @ %.4f  [%s]  held=%dd",
+                ticker, sl_price, sl_reason, days_held,
+            )
 
         ib.sleep(2)
     except Exception as e:
@@ -752,17 +978,34 @@ def _eod_close(paper: bool, cfg: dict):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Crowded Signal Failure Trading Agent")
+    parser = argparse.ArgumentParser(
+        description="Crowded Signal Failure Trading Agent",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Model variants:
+  h1d_longonly  1-day hold, BUY-only  — fastest intraday fades
+  h3d_longonly  3-day hold, BUY-only  — default
+  h5d_longonly  5-day hold, BUY-only  — multi-day positions
+  h1d_both      1-day hold, BUY+SELL  — allow_short=true required
+  h3d_both      3-day hold, BUY+SELL
+  h5d_both      5-day hold, BUY+SELL
+""",
+    )
     parser.add_argument("--paper", action="store_true", default=True,
                         help="Paper trading mode (default)")
     parser.add_argument("--live", action="store_true",
-                        help="Live trading mode (real money)")
+                        help="Live trading mode (real money — confirm required)")
     parser.add_argument("--once", action="store_true",
-                        help="Run once immediately, do not schedule")
+                        help="Run one cycle immediately and exit")
     parser.add_argument("--status", action="store_true",
-                        help="Print journal status and exit")
+                        help="Print journal summary and exit")
     parser.add_argument("--eod-close", action="store_true",
-                        help="Cancel all brackets and close all longs now (EOD safety net)")
+                        help="Cancel all brackets and close all positions now")
+    parser.add_argument("--variant", metavar="VARIANT",
+                        help="Model variant to use (e.g. h3d_longonly, h1d_both). "
+                             "If omitted an interactive menu is shown on startup.")
+    parser.add_argument("--no-menu", action="store_true",
+                        help="Skip interactive variant menu, use config default")
     args = parser.parse_args()
 
     if args.live and args.paper:
@@ -770,6 +1013,7 @@ def main():
 
     cfg = load_config()
 
+    # ── Status / utility commands (no variant needed) ─────────────────────────
     if args.status:
         from agent.journal import Journal
         journal = Journal(cfg["journal"]["db_path"])
@@ -780,69 +1024,135 @@ def main():
         _eod_close(paper=not args.live, cfg=cfg)
         return
 
+    # ── Variant selection ─────────────────────────────────────────────────────
+    if args.variant:
+        _apply_variant(cfg, args.variant)
+    elif not args.no_menu and sys.stdin.isatty():
+        chosen = _choose_variant_interactive(cfg)
+        if chosen != cfg["model"].get("variant"):
+            _apply_variant(cfg, chosen)
+        else:
+            log.info("Active model variant: %s (from config)", cfg["model"].get("variant"))
+    else:
+        log.info("Active model variant: %s (from config)", cfg["model"].get("variant"))
+
+    # ── Live trading confirmation ─────────────────────────────────────────────
     if args.live:
-        log.warning("⚠  LIVE TRADING MODE — real money will be used")
-        confirm = input("Type 'yes' to confirm: ")
+        variant      = cfg["model"].get("variant", "unknown")
+        allow_short  = cfg["strategy"].get("allow_short", False)
+        pos_pct      = cfg["risk"].get("max_position_pct", 0.02) * 100
+        capital      = cfg["capital"].get("initial", 0)
+        max_loss     = cfg["risk"].get("max_daily_loss_eur", 0)
+        print()
+        print("!" * 64)
+        print("!!                                                            !!")
+        print("!!          *** LIVE TRADING -- REAL MONEY ***                !!")
+        print("!!                                                            !!")
+        print("!" * 64)
+        print(f"  Variant      : {variant}")
+        print(f"  Allow short  : {allow_short}")
+        print(f"  Position size: {pos_pct:.0f}% NAV  (~{capital * pos_pct / 100:,.0f} EUR per trade)")
+        print(f"  Max daily loss: {max_loss:,.0f} EUR  (trading stops if hit)")
+        print(f"  SL / TP      : {cfg['risk'].get('stop_loss_pct',0)*100:.1f}% / "
+              f"{cfg['risk'].get('take_profit_pct',0)*100:.1f}%")
+        print()
+        print("  Orders will be sent to IBKR and will use REAL FUNDS.")
+        print("  Make sure IB Gateway is on the LIVE (not paper) port.")
+        print()
+        confirm = input("  Type 'yes' to confirm live trading, anything else to abort: ")
         if confirm.strip().lower() != "yes":
             print("Aborted.")
             return
+        print()
+        print("  Live trading confirmed. Starting agent...")
+        print("!" * 64)
+        print()
 
     if args.once:
         run_once(paper=not args.live, cfg=cfg)
         return
 
-    # Dual-speed intraday loop:
-    #   Fast  (monitor_interval_min =  5 min): trail stops + time exits
-    #   Slow  (scan_interval_min    = 30 min): full signal scan + new trades
+    # ── Continuous intraday loop ──────────────────────────────────────────────
     monitor_interval = cfg["strategy"].get("monitor_interval_min", 5) * 60
     scan_interval    = cfg["strategy"].get("scan_interval_min", 30) * 60
     eod_str          = cfg["strategy"].get("eod_close_time", "16:30")
     eod_h, eod_m     = int(eod_str.split(":")[0]), int(eod_str.split(":")[1])
 
     log.info(
-        "Intraday monitor started — position check every %d min, "
-        "signal scan every %d min, EOD close at %s CET (Ctrl+C to stop)",
+        "Agent started — variant=%s  monitor=%dmin  scan=%dmin  EOD=%s CET",
+        cfg["model"].get("variant", "?"),
         cfg["strategy"].get("monitor_interval_min", 5),
         cfg["strategy"].get("scan_interval_min", 30),
         eod_str,
     )
+    log.info("Press Ctrl+C to stop.")
 
-    last_scan_time    = 0.0    # force immediate scan on startup
-    overnight_checked = False  # run overnight check once per market open
+    last_scan_time      = 0.0    # force immediate scan on startup
+    overnight_checked   = False  # run morning check once per market open
+    last_cycle_ok       = True   # track whether previous cycle connected OK
+    reconnect_pending   = False  # set when connection loss is detected
 
     while True:
         now = datetime.now(CET)
 
-        # EOD close — runs once when we cross the EOD time
+        # ── EOD close — runs once per day at eod_close_time ──────────────────
         if now.weekday() < 5 and now.hour == eod_h and now.minute >= eod_m and now.minute < eod_m + 5:
-            log.info("EOD close time reached (%s CET) — closing all open positions", eod_str)
+            log.info("EOD close time (%s CET) — flattening all positions", eod_str)
             _eod_close(paper=not args.live, cfg=cfg)
-            overnight_checked = False   # reset so next day's open triggers check
-            time.sleep(300)   # sleep past the 5-min window
+            overnight_checked = False   # reset for next day
+            reconnect_pending  = False
+            last_cycle_ok      = True
+            time.sleep(300)             # sleep past the 5-min window
             continue
 
         if is_market_open(now):
-            # ── MORNING PRIORITY: evaluate any overnight positions FIRST ──────
-            # Always runs before any new signal scan or trade placement.
-            # Covers shorts (cover immediately), missing SLs (re-place), and
-            # positions that were closed by IBKR SL/TP while agent was offline.
+            # ── RECONNECT RECOVERY (highest priority) ─────────────────────
+            # If the previous cycle failed due to connection loss, sync positions
+            # before doing anything else.  This catches TP/SL fills that happened
+            # while we were offline and ensures SL orders are active.
+            if reconnect_pending:
+                try:
+                    _reconnect_evaluate(paper=not args.live, cfg=cfg)
+                    reconnect_pending = False
+                    last_cycle_ok     = True
+                except Exception as e:
+                    log.warning("Reconnect evaluation failed: %s — will retry", e)
+                    time.sleep(monitor_interval)
+                    continue
+
+            # ── MORNING PRIORITY: overnight position check FIRST ──────────
             if not overnight_checked:
                 log.info("=== Morning check: evaluating overnight positions ===")
                 _evaluate_overnight_positions(paper=not args.live, cfg=cfg)
                 overnight_checked = True
                 log.info("=== Morning check complete ===")
 
+            # ── Fast loop — position monitor (trail stops, time exits) ─────
+            try:
+                _monitor_open_positions(paper=not args.live, cfg=cfg)
+                last_cycle_ok = True
+            except Exception as e:
+                if not last_cycle_ok:
+                    reconnect_pending = True
+                log.warning("Monitor cycle error: %s", e)
+                last_cycle_ok = False
 
-            # Fast loop — always runs (trail stops, time exits, exit sync)
-            _monitor_open_positions(paper=not args.live, cfg=cfg)
-
-            # Slow loop — full signal scan every scan_interval
+            # ── Slow loop — full signal scan + new trades ─────────────────
             if time.time() - last_scan_time >= scan_interval:
-                run_once(paper=not args.live, cfg=cfg)
-                last_scan_time = time.time()
+                try:
+                    run_once(paper=not args.live, cfg=cfg)
+                    last_scan_time = time.time()
+                    last_cycle_ok  = True
+                except Exception as e:
+                    log.warning("Scan cycle error: %s", e)
+                    last_cycle_ok = False
+                    if "connection" in str(e).lower() or "disconnected" in str(e).lower():
+                        reconnect_pending = True
+                        log.warning("Connection issue detected — will run reconnect evaluation on next cycle")
         else:
-            overnight_checked = False   # market closed — reset flag for next open
-            log.info("Market closed at %s — waiting...", now.strftime("%H:%M CET"))
+            overnight_checked  = False   # market closed — reset for next open
+            reconnect_pending  = False
+            log.info("Market closed (%s) — waiting...", now.strftime("%H:%M CET"))
 
         time.sleep(monitor_interval)
 

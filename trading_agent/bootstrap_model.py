@@ -1,11 +1,29 @@
 """
 Bootstrap script — fetches historical data, runs the full research pipeline,
-and saves a trained XGBoost model ready for the agent.
+and saves trained XGBoost models ready for the agent.
 
-Run once before starting the agent:
-    python bootstrap_model.py --yfinance    # no IBKR required (recommended first run)
-    python bootstrap_model.py --paper       # use IBKR paper port 4002
-    python bootstrap_model.py --live        # use IBKR live port 4001
+Model variants are defined by two axes:
+  horizon  : 1d / 3d / 5d  — forward return window used for labels
+  mode     : longonly / both — which signal directions are included in training
+               longonly  trains only on bearish alerts  (FADE → BUY)
+               both      trains on all alert directions (FADE → BUY or SELL)
+
+Six models are trained and saved:
+  xgboost_h1d_longonly.joblib   feature_cols_h1d_longonly.json
+  xgboost_h3d_longonly.joblib   feature_cols_h3d_longonly.json  ← default
+  xgboost_h5d_longonly.joblib   feature_cols_h5d_longonly.json
+  xgboost_h1d_both.joblib       feature_cols_h1d_both.json
+  xgboost_h3d_both.joblib       feature_cols_h3d_both.json
+  xgboost_h5d_both.joblib       feature_cols_h5d_both.json
+
+After training, set model.variant in configs/config.yaml to select which
+model the agent uses (e.g. "h3d_longonly" for intraday-ish long-only).
+
+Usage:
+    python bootstrap_model.py --yfinance             # train all 6 variants
+    python bootstrap_model.py --yfinance --variant h3d_longonly  # one variant
+    python bootstrap_model.py --paper                # IBKR paper port
+    python bootstrap_model.py --live                 # IBKR live port
 """
 
 import argparse
@@ -24,6 +42,28 @@ import joblib
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
+
+# All variants: (horizon_days, mode)
+ALL_VARIANTS = [
+    (1, "longonly"),
+    (3, "longonly"),
+    (5, "longonly"),
+    (1, "both"),
+    (3, "both"),
+    (5, "both"),
+]
+
+
+def variant_name(horizon: int, mode: str) -> str:
+    return f"h{horizon}d_{mode}"
+
+
+def variant_paths(model_dir: Path, horizon: int, mode: str) -> tuple[Path, Path]:
+    name = variant_name(horizon, mode)
+    return (
+        model_dir / f"xgboost_{name}.joblib",
+        model_dir / f"feature_cols_{name}.json",
+    )
 
 
 def _fetch_yfinance(tickers: list[str], days: int, cache_dir: str | None) -> dict:
@@ -72,7 +112,132 @@ def _fetch_yfinance(tickers: list[str], days: int, cache_dir: str | None) -> dic
     return results
 
 
-def main(paper: bool = True, use_yfinance: bool = False):
+def _build_feature_matrix(labeled: pd.DataFrame, feat_panel: pd.DataFrame,
+                           horizon: int, mode: str) -> tuple:
+    """
+    Build (X, y, feat_cols) for a specific training variant.
+
+    mode = "longonly"  → only train on bearish alerts (FADE → BUY).
+                         These are the signals the long-only agent actually trades.
+                         Training on matching examples gives better calibration.
+    mode = "both"      → train on all signal directions. Use this model when
+                         allow_short=True so it sees SELL-side failure events too.
+    """
+    EXCLUDE = {
+        "date", "ticker", "open", "high", "low", "close", "volume",
+        "ret_1d_lead", "fwd_ret_1d", "fwd_ret_3d", "fwd_ret_5d",
+        "alert_name", "direction", "n_simultaneous_alerts", "_dir_raw",
+    }
+
+    price_feat_cols = [c for c in feat_panel.columns if c not in EXCLUDE]
+    price_feats = feat_panel[["date", "ticker"] + price_feat_cols].copy()
+    price_feats["date"] = pd.to_datetime(price_feats["date"])
+
+    lab = labeled.copy()
+    lab["date"] = pd.to_datetime(lab["date"])
+
+    # Direction filter
+    if mode == "longonly":
+        # Keep only bearish alerts (oversold/breakdown) → FADE produces BUY entries.
+        # Also keep neutral for context; exclude bullish-only (those are FOLLOW=BUY
+        # or FADE=SELL which long-only never trades).
+        lab = lab[lab["direction"].isin(["bearish", "neutral"])].copy()
+        log.info("  [longonly] filtered to bearish+neutral: %d events", len(lab))
+
+    lab["_dir_raw"] = lab["direction"]
+    lab = pd.get_dummies(lab, columns=["direction", "alert_name"], drop_first=False)
+
+    merged = lab.merge(
+        price_feats.drop_duplicates(["date", "ticker"]),
+        on=["date", "ticker"], how="left", suffixes=("", "_feat"),
+    )
+    merged = merged.reset_index(drop=True)
+
+    feat_cols = (
+        [c for c in merged.columns if c in price_feat_cols]
+        + [c for c in merged.columns
+           if c.startswith("direction_") or c.startswith("alert_name_")]
+        + ["n_simultaneous_alerts"]
+    )
+    feat_cols = [c for c in feat_cols if merged[c].dtype != object]
+
+    label_col = f"label_failure_{horizon}d"
+    if label_col not in merged.columns:
+        log.error("Label column %s not found — skipping", label_col)
+        return None, None, None
+
+    valid = merged[label_col].notna()
+    X = merged.loc[valid, feat_cols].fillna(-1)
+    y = merged.loc[valid, label_col]
+
+    return X, y, feat_cols
+
+
+def _train_one_variant(X, y, feat_cols: list, horizon: int, mode: str,
+                       model_dir: Path) -> None:
+    """Train and save one XGBoost model variant."""
+    from xgboost import XGBClassifier
+    from sklearn.metrics import roc_auc_score, precision_score
+
+    name = variant_name(horizon, mode)
+    log.info("=" * 60)
+    log.info("Training variant: %s  |  %d samples  |  %d features  |  pos=%.3f",
+             name, len(y), len(feat_cols), y.mean())
+
+    split_idx = int(len(X) * 0.8)
+    X_train, X_val = X.iloc[:split_idx], X.iloc[split_idx:]
+    y_train, y_val = y.iloc[:split_idx], y.iloc[split_idx:]
+
+    neg, pos = (y_train == 0).sum(), (y_train == 1).sum()
+    spw = neg / pos if pos > 0 else 1.0
+
+    # h1d: lighter model — horizon is very short, fewer trees needed to avoid overfit
+    # h5d: deeper trees — more regime context captured at longer horizons
+    max_depth    = {1: 4, 3: 5, 5: 6}.get(horizon, 5)
+    n_estimators = {1: 600, 3: 1000, 5: 800}.get(horizon, 1000)
+
+    model = XGBClassifier(
+        n_estimators=n_estimators,
+        early_stopping_rounds=50,
+        max_depth=max_depth,
+        learning_rate=0.03,
+        subsample=0.8,
+        colsample_bytree=0.7,
+        min_child_weight=5,
+        gamma=0.1,
+        eval_metric="auc",
+        random_state=42,
+        n_jobs=-1,
+        scale_pos_weight=spw,
+    )
+    model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
+
+    val_proba = model.predict_proba(X_val)[:, 1]
+    auc = roc_auc_score(y_val, val_proba)
+    log.info("  ROC-AUC: %.4f  (best_iter=%d)", auc, model.best_iteration)
+
+    for t in [0.55, 0.60, 0.65, 0.70]:
+        pred = (val_proba >= t).astype(int)
+        n = int(pred.sum())
+        if n > 0:
+            prec = precision_score(y_val, pred, zero_division=0)
+            log.info("    thr=%.2f  signals=%4d  precision=%.3f", t, n, prec)
+
+    model_path, cols_path = variant_paths(model_dir, horizon, mode)
+    joblib.dump(model, model_path)
+    with open(cols_path, "w") as f:
+        json.dump(feat_cols, f)
+    log.info("  Saved: %s", model_path.name)
+
+    # Feature importance top-10
+    importances = model.feature_importances_
+    top10 = sorted(zip(feat_cols, importances), key=lambda x: -x[1])[:10]
+    log.info("  Top-10 features: %s",
+             "  ".join(f"{n}={v:.3f}" for n, v in top10))
+
+
+def main(paper: bool = True, use_yfinance: bool = False,
+         target_variant: str | None = None):
     # ── Load config ─────────────────────────────────────────────────────────
     with open("configs/config.yaml") as f:
         cfg = yaml.safe_load(f)
@@ -83,8 +248,21 @@ def main(paper: bool = True, use_yfinance: bool = False):
     with open(parent_tickers_file) as f:
         tickers = yaml.safe_load(f)["tickers"]
 
-    log.info("Bootstrap starting. Universe: %d tickers. yfinance=%s paper=%s",
-             len(tickers), use_yfinance, paper)
+    # Determine which variants to train
+    if target_variant:
+        parts = target_variant.split("_", 1)
+        if len(parts) != 2 or not parts[0].startswith("h"):
+            log.error("Invalid variant format. Use e.g. 'h3d_longonly' or 'h1d_both'")
+            sys.exit(1)
+        horizon = int(parts[0][1:-1])
+        mode = parts[1]
+        variants_to_train = [(horizon, mode)]
+    else:
+        variants_to_train = ALL_VARIANTS
+
+    log.info("Bootstrap starting. Universe: %d tickers. yfinance=%s  variants=%s",
+             len(tickers), use_yfinance,
+             [variant_name(h, m) for h, m in variants_to_train])
 
     # ── Step 1: Fetch data ───────────────────────────────────────────────────
     cache_dir = cfg["data"]["cache_dir"]
@@ -124,7 +302,6 @@ def main(paper: bool = True, use_yfinance: bool = False):
     raw_dict = {}
     for ticker, df in universe_data.items():
         d = df.copy()
-        # Normalise to lowercase first, then title-case OHLCV for build_panel
         d.columns = [c.lower() for c in d.columns]
         rename_map = {"open": "Open", "high": "High", "low": "Low",
                       "close": "Close", "volume": "Volume"}
@@ -139,8 +316,7 @@ def main(paper: bool = True, use_yfinance: bool = False):
     panel = build_panel(raw_dict, min_history_days=cfg["model"]["min_history_days"])
     log.info("Panel: %s", panel.shape)
 
-    # ── Step 3: Features + alerts + labels ──────────────────────────────────
-    # Fetch index for regime features
+    # ── Step 3: Features + alerts + labels ───────────────────────────────────
     try:
         import yfinance as yf
         idx = yf.download("^STOXX50E", start="2010-01-01", auto_adjust=True, progress=False)
@@ -156,6 +332,7 @@ def main(paper: bool = True, use_yfinance: bool = False):
     from src.alerts.engine import run_alert_engine
     from src.features.engineering import add_alert_features
 
+    log.info("Building features (this may take 1-2 minutes for 2yr / 49 tickers)...")
     feat_panel = build_features(panel, index_close=index_close)
     feat_panel = compute_forward_returns(feat_panel, horizons=[1, 3, 5])
 
@@ -163,114 +340,83 @@ def main(paper: bool = True, use_yfinance: bool = False):
     events = add_alert_features(events, panel)
     labeled = assign_labels(events, feat_panel, horizons=[1, 3, 5], theta=0.005)
 
-    log.info("Labeled events: %d  (failure_rate_3d=%.3f)",
-             len(labeled), labeled["label_failure_3d"].mean())
+    log.info("Labeled events: %d  failure_rate 1d=%.3f  3d=%.3f  5d=%.3f",
+             len(labeled),
+             labeled["label_failure_1d"].mean(),
+             labeled["label_failure_3d"].mean(),
+             labeled["label_failure_5d"].mean())
 
-    # ── Step 4: Build feature matrix ─────────────────────────────────────────
-    EXCLUDE = {"date","ticker","open","high","low","close","volume",
-               "ret_1d_lead","fwd_ret_1d","fwd_ret_3d","fwd_ret_5d",
-               "alert_name","direction","n_simultaneous_alerts","_dir_raw"}
-
-    price_feat_cols = [c for c in feat_panel.columns if c not in EXCLUDE]
-    price_feats = feat_panel[["date","ticker"] + price_feat_cols].copy()
-    price_feats["date"] = pd.to_datetime(price_feats["date"])
-
-    labeled["date"] = pd.to_datetime(labeled["date"])
-    labeled["_dir_raw"] = labeled["direction"]
-    labeled = pd.get_dummies(labeled, columns=["direction","alert_name"], drop_first=False)
-
-    merged = labeled.merge(
-        price_feats.drop_duplicates(["date","ticker"]),
-        on=["date","ticker"], how="left", suffixes=("","_feat")
-    )
-    merged = merged.reset_index(drop=True)
-
-    feat_cols = (
-        [c for c in merged.columns if c in price_feat_cols]
-        + [c for c in merged.columns if c.startswith("direction_") or c.startswith("alert_name_")]
-        + ["n_simultaneous_alerts"]
-    )
-    feat_cols = [c for c in feat_cols if merged[c].dtype != object]
-
-    label_col = "label_failure_3d"
-    valid = merged[label_col].notna()
-    X = merged.loc[valid, feat_cols].fillna(-1)
-    y = merged.loc[valid, label_col]
-
-    log.info("Training XGBoost: %d samples, %d features, pos_rate=%.3f",
-             len(y), len(feat_cols), y.mean())
-
-    # ── Step 5: Train model ──────────────────────────────────────────────────
-    from xgboost import XGBClassifier
-    from sklearn.metrics import roc_auc_score, precision_score
-
-    split_idx = int(len(X) * 0.8)
-    X_train, X_val = X.iloc[:split_idx], X.iloc[split_idx:]
-    y_train, y_val = y.iloc[:split_idx], y.iloc[split_idx:]
-
-    neg, pos = (y_train == 0).sum(), (y_train == 1).sum()
-    spw = neg / pos if pos > 0 else 1.0
-
-    model = XGBClassifier(
-        # More trees + early stopping avoids both under/over-fitting on 2-year dataset
-        n_estimators=1000,
-        early_stopping_rounds=50,
-        max_depth=5,           # one level deeper — captures regime × signal interactions
-        learning_rate=0.03,    # slower learning pairs with more trees
-        subsample=0.8,
-        colsample_bytree=0.7,  # slightly more aggressive feature dropout
-        min_child_weight=5,    # prevent overfitting on small leaf nodes
-        gamma=0.1,             # require minimum gain to split
-        eval_metric="auc",     # optimise directly for ranking (AUC), not logloss
-        random_state=42,
-        n_jobs=-1,
-        scale_pos_weight=spw,
-    )
-    model.fit(X_train, y_train,
-              eval_set=[(X_val, y_val)],
-              verbose=False)
-
-    val_proba = model.predict_proba(X_val)[:, 1]
-    auc = roc_auc_score(y_val, val_proba)
-    log.info("Validation ROC-AUC: %.4f  (best iteration: %d)",
-             auc, model.best_iteration)
-
-    # Report precision at the operating thresholds
-    for t in [0.55, 0.60, 0.65, 0.70]:
-        pred = (val_proba >= t).astype(int)
-        n = int(pred.sum())
-        if n > 0:
-            prec = precision_score(y_val, pred, zero_division=0)
-            log.info("  threshold=%.2f  signals=%4d  precision=%.3f", t, n, prec)
-
-    # ── Step 6: Save model and feature cols ──────────────────────────────────
+    # ── Step 4–5: Train all requested variants ────────────────────────────────
     model_dir = Path(cfg["model"]["path"]).parent
     model_dir.mkdir(parents=True, exist_ok=True)
 
-    joblib.dump(model, cfg["model"]["path"])
-    with open(cfg["model"]["feature_cols_path"], "w") as f:
-        json.dump(feat_cols, f)
+    for horizon, mode in variants_to_train:
+        X, y, feat_cols = _build_feature_matrix(labeled, feat_panel, horizon, mode)
+        if X is None:
+            log.warning("Skipping variant %s — feature matrix build failed",
+                        variant_name(horizon, mode))
+            continue
+        _train_one_variant(X, y, feat_cols, horizon, mode, model_dir)
 
-    log.info("Model saved: %s", cfg["model"]["path"])
-    log.info("Feature cols saved: %s", cfg["model"]["feature_cols_path"])
-    log.info("Bootstrap complete. Ready to run: python run_agent.py --paper")
+    # ── Step 6: Report summary ────────────────────────────────────────────────
+    log.info("=" * 60)
+    log.info("All variants trained. Files in %s:", model_dir)
+    for f in sorted(model_dir.glob("xgboost_*.joblib")):
+        log.info("  %s", f.name)
+
+    # Show current active variant from config
+    active = cfg["model"].get("variant", "h3d_longonly")
+    active_path, active_cols = variant_paths(model_dir, *_parse_variant(active))
+    if active_path.exists():
+        log.info("")
+        log.info("Active variant in config: %s", active)
+        log.info("  model     : %s", active_path)
+        log.info("  feat cols : %s", active_cols)
+    else:
+        log.warning("Active variant '%s' not found — update model.variant in config.yaml", active)
+
+    log.info("")
+    log.info("To change active model, set model.variant in configs/config.yaml, then:")
+    log.info("  python run_agent.py --paper")
+
+
+def _parse_variant(variant: str) -> tuple[int, str]:
+    """Parse 'h3d_longonly' → (3, 'longonly')."""
+    parts = variant.split("_", 1)
+    return int(parts[0][1:-1]), parts[1]
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Bootstrap XGBoost model for the trading agent")
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--yfinance", action="store_true",
-                      help="Use yfinance (no IBKR required) — recommended for first run")
-    mode.add_argument("--paper", action="store_true",
-                      help="Use IBKR paper trading port (4002)")
-    mode.add_argument("--live", action="store_true",
-                      help="Use IBKR live trading port (4001)")
+    parser = argparse.ArgumentParser(
+        description="Bootstrap XGBoost models for the trading agent",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Variants trained (horizon × direction mode):
+  h1d_longonly  h3d_longonly*  h5d_longonly
+  h1d_both      h3d_both       h5d_both
+
+  *default active variant (set via model.variant in config.yaml)
+
+longonly: train on bearish alerts only → FADE=BUY. Use when allow_short=false.
+both:     train on all directions      → FADE=BUY or SELL. Use when allow_short=true.
+""",
+    )
+    src = parser.add_mutually_exclusive_group()
+    src.add_argument("--yfinance", action="store_true",
+                     help="Use yfinance (no IBKR required) — recommended")
+    src.add_argument("--paper", action="store_true",
+                     help="Use IBKR paper trading port (4002)")
+    src.add_argument("--live", action="store_true",
+                     help="Use IBKR live trading port (4001)")
+    parser.add_argument(
+        "--variant", metavar="VARIANT",
+        help="Train only one variant e.g. h3d_longonly (default: train all 6)"
+    )
     args = parser.parse_args()
 
     if args.yfinance:
-        main(use_yfinance=True)
+        main(use_yfinance=True, target_variant=args.variant)
     elif args.live:
-        main(paper=False, use_yfinance=False)
+        main(paper=False, use_yfinance=False, target_variant=args.variant)
     else:
-        # Default: paper (with yfinance fallback on connect failure)
-        main(paper=True, use_yfinance=False)
+        main(paper=True, use_yfinance=False, target_variant=args.variant)

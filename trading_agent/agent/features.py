@@ -25,8 +25,10 @@ from src.features.engineering import (
     add_volatility_regime,
     add_volume_features,
     add_calendar_features,
+    add_intraday_structure_features,
     add_regime_features,
     add_peer_correlation_feature,
+    _align_index,
 )
 
 log = logging.getLogger(__name__)
@@ -49,9 +51,12 @@ def build_features_for_ticker(
     df = add_volatility_regime(df)
     df = add_volume_features(df, [5, 20])
     df = add_calendar_features(df)
+    df = add_intraday_structure_features(df)
 
     if index_close is not None:
         df = add_regime_features(df, index_close)
+        idx = _align_index(index_close, df.index)
+        df["rel_strength_1d"] = df["close"].pct_change(1) - idx.pct_change(1)
 
     return df.reset_index()
 
