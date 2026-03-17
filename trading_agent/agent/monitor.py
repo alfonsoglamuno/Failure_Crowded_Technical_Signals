@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from datetime import date, datetime, timezone
 
-from ib_insync import IB, MarketOrder, Stock, StopOrder
+from ib_insync import IB, MarketOrder, Stock
 
 log = logging.getLogger(__name__)
 
@@ -105,13 +105,16 @@ class PositionMonitor:
         trail_step    = cfg["risk"].get("trail_step_pct",    0.003)
         max_hold_h    = cfg["risk"].get("max_hold_hours",    4.0)
 
-        # Fetch active stop orders from IBKR, keyed by parentId
+        # Fetch active stop orders from IBKR, keyed by parentId.
+        # Use orderType == "STP" instead of isinstance(StopOrder) because
+        # orders received from IBKR on reconnect are plain Order objects,
+        # not StopOrder instances — isinstance check always returns False.
         self.ib.reqAllOpenOrders()
         self.ib.sleep(1)
         stop_trades = {
             t.order.parentId: t
             for t in self.ib.trades()
-            if isinstance(t.order, StopOrder)
+            if getattr(t.order, "orderType", "") == "STP"
             and getattr(t.order, "parentId", 0)
             and t.orderStatus.status not in ("Filled", "Cancelled", "Inactive")
         }
