@@ -1,9 +1,11 @@
 """
 Trading report — daily, weekly, monthly performance summaries.
 
+All P&L figures are NET of commissions.
+Return % is always relative to capital actually deployed (entry_price × quantity).
+
 Usage:
     python report.py                  # today
-    python report.py --today
     python report.py --week
     python report.py --month
     python report.py --date 2026-03-17
@@ -14,12 +16,11 @@ from __future__ import annotations
 
 import argparse
 import sqlite3
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
-
 DB_PATH = "data/journal.db"
-W = 70
+W = 76
 
 
 def _conn(db_path: str) -> sqlite3.Connection:
@@ -28,28 +29,81 @@ def _conn(db_path: str) -> sqlite3.Connection:
     return conn
 
 
-def _bar(value: float, max_val: float, width: int = 20, char: str = "#") -> str:
+def _sign(v: float, decimals: int = 2) -> str:
+    fmt = f"+{{:.{decimals}f}}" if v >= 0 else f"{{:.{decimals}f}}"
+    return fmt.format(v)
+
+
+def _pct(v: float) -> str:
+    """Format a ratio as a signed percentage string."""
+    return _sign(v * 100, 2) + "%"
+
+
+def _bar(value: float, max_val: float, width: int = 14) -> str:
     if max_val == 0:
         return ""
     filled = int(abs(value) / max_val * width)
+    char = "+" if value >= 0 else "-"
     return char * min(filled, width)
 
 
-def _sign(v: float) -> str:
-    return f"+{v:.2f}" if v >= 0 else f"{v:.2f}"
+def sep(char: str = "-") -> str:
+    return char * W
+
+
+def header(title: str) -> str:
+    return f"\n{'=' * W}\n  {title}\n{'=' * W}"
+
+
+# ── Capital deployed per trade ─────────────────────────────────────────────────
+
+def _invested(t: dict) -> float:
+    """Capital deployed = entry_price × quantity (gross position size)."""
+    ep = t.get("entry_price") or 0
+    qty = t.get("quantity") or 0
+    return ep * qty
+
+
+def _commission(t: dict) -> float:
+    """Commission = pnl_gross - pnl_net."""
+    gross = t.get("pnl_gross") or 0
+    net   = t.get("pnl_net")
+    if net is None:
+        return 0.0
+    return gross - net
+
+
+def _return_pct(t: dict) -> float | None:
+    """Net return as fraction of capital invested."""
+    inv = _invested(t)
+    net = t.get("pnl_net")
+    if not inv or net is None:
+        return None
+    return net / inv
+
+
+def _exit_label(t: dict) -> str:
+    ep = t.get("exit_price") or 0
+    tp = t.get("take_profit") or 0
+    sl = t.get("stop_loss") or 0
+    if tp and abs(ep - tp) / tp < 0.005:
+        return "TP"
+    if sl and abs(ep - sl) / sl < 0.005:
+        return "SL"
+    return "MKT"
 
 
 # ── Query helpers ──────────────────────────────────────────────────────────────
 
 def get_trades(db: str, start: date, end: date) -> list[dict]:
-    """Completed trades (with exit price) in date range."""
     with _conn(db) as conn:
         rows = conn.execute("""
-            SELECT t.*, s.action, s.alert_name, s.alert_direction, s.failure_proba,
-                   s.crowding_score, s.conviction
+            SELECT t.*, s.action, s.alert_name, s.alert_direction,
+                   s.failure_proba, s.crowding_score, s.conviction
             FROM trades t
             LEFT JOIN signals s ON t.signal_id = s.id
             WHERE t.exit_price IS NOT NULL
+              AND t.pnl_net IS NOT NULL
               AND t.date >= ? AND t.date <= ?
             ORDER BY t.date, t.ts
         """, (str(start), str(end))).fetchall()
@@ -62,19 +116,10 @@ def get_open_trades(db: str) -> list[dict]:
             SELECT t.*, s.action, s.alert_name
             FROM trades t
             LEFT JOIN signals s ON t.signal_id = s.id
-            WHERE t.exit_price IS NULL AND t.status NOT IN ('cancelled','error')
+            WHERE t.exit_price IS NULL
+              AND t.status NOT IN ('cancelled','error')
             ORDER BY t.date DESC
         """).fetchall()
-    return [dict(r) for r in rows]
-
-
-def get_daily_summaries(db: str, start: date, end: date) -> list[dict]:
-    with _conn(db) as conn:
-        rows = conn.execute("""
-            SELECT * FROM daily_summary
-            WHERE date >= ? AND date <= ?
-            ORDER BY date
-        """, (str(start), str(end))).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -83,30 +128,50 @@ def get_daily_summaries(db: str, start: date, end: date) -> list[dict]:
 def compute_stats(trades: list[dict]) -> dict:
     if not trades:
         return {}
-    pnls = [t["pnl_net"] for t in trades if t.get("pnl_net") is not None]
-    if not pnls:
+
+    completed = [t for t in trades if t.get("pnl_net") is not None]
+    if not completed:
         return {}
-    wins  = [p for p in pnls if p > 0]
-    losses = [p for p in pnls if p <= 0]
-    best  = max(trades, key=lambda t: t.get("pnl_net") or -9e9)
-    worst = min(trades, key=lambda t: t.get("pnl_net") or 9e9)
-    gross_wins   = sum(wins)   if wins   else 0
-    gross_losses = abs(sum(losses)) if losses else 0
-    profit_factor = (gross_wins / gross_losses) if gross_losses > 0 else float("inf")
+
+    pnls        = [t["pnl_net"] for t in completed]
+    rets        = [r for t in completed for r in [_return_pct(t)] if r is not None]
+    commissions = [_commission(t) for t in completed]
+    invested    = [_invested(t) for t in completed]
+
+    wins   = [t for t in completed if t["pnl_net"] > 0]
+    losses = [t for t in completed if t["pnl_net"] <= 0]
+
+    best  = max(completed, key=lambda t: _return_pct(t) or -9e9)
+    worst = min(completed, key=lambda t: _return_pct(t) or 9e9)
+
+    gross_wins   = sum(t["pnl_net"] for t in wins)
+    gross_losses = abs(sum(t["pnl_net"] for t in losses))
+    profit_factor = gross_wins / gross_losses if gross_losses > 0 else float("inf")
+
+    total_invested = sum(invested)
+    total_pnl      = sum(pnls)
+    total_comm     = sum(commissions)
+
     return {
-        "n":             len(pnls),
-        "n_wins":        len(wins),
-        "n_losses":      len(losses),
-        "hit_rate":      len(wins) / len(pnls) if pnls else 0,
-        "total_pnl":     sum(pnls),
-        "avg_pnl":       sum(pnls) / len(pnls),
-        "best_pnl":      best.get("pnl_net", 0),
-        "worst_pnl":     worst.get("pnl_net", 0),
-        "best_trade":    best,
-        "worst_trade":   worst,
-        "profit_factor": profit_factor,
-        "avg_win":       sum(wins) / len(wins) if wins else 0,
-        "avg_loss":      sum(losses) / len(losses) if losses else 0,
+        "n":                len(completed),
+        "n_wins":           len(wins),
+        "n_losses":         len(losses),
+        "hit_rate":         len(wins) / len(completed),
+        "total_pnl":        total_pnl,
+        "total_commission": total_comm,
+        "total_invested":   total_invested,
+        "roic":             total_pnl / total_invested if total_invested else 0,
+        "avg_pnl":          total_pnl / len(completed),
+        "avg_return_pct":   sum(rets) / len(rets) if rets else 0,
+        "avg_win_pct":      sum(_return_pct(t) or 0 for t in wins) / len(wins) if wins else 0,
+        "avg_loss_pct":     sum(_return_pct(t) or 0 for t in losses) / len(losses) if losses else 0,
+        "best_pnl":         best.get("pnl_net", 0),
+        "worst_pnl":        worst.get("pnl_net", 0),
+        "best_return_pct":  _return_pct(best) or 0,
+        "worst_return_pct": _return_pct(worst) or 0,
+        "best_trade":       best,
+        "worst_trade":      worst,
+        "profit_factor":    profit_factor,
     }
 
 
@@ -115,46 +180,47 @@ def by_ticker(trades: list[dict]) -> dict[str, dict]:
     groups: dict[str, list] = defaultdict(list)
     for t in trades:
         groups[t["ticker"]].append(t)
-    return {tk: compute_stats(ts) for tk, ts in groups.items()}
+    return {tk: compute_stats(ts) for tk, ts in sorted(groups.items())}
 
 
 def by_alert(trades: list[dict]) -> dict[str, dict]:
     from collections import defaultdict
     groups: dict[str, list] = defaultdict(list)
     for t in trades:
-        key = t.get("alert_name") or "unknown"
-        groups[key].append(t)
+        groups[t.get("alert_name") or "unknown"].append(t)
     return {k: compute_stats(v) for k, v in groups.items()}
 
 
 # ── Rendering ──────────────────────────────────────────────────────────────────
 
-def sep(char: str = "-") -> str:
-    return char * W
-
-
-def header(title: str, char: str = "=") -> str:
-    return f"\n{char * W}\n  {title}\n{char * W}"
-
-
 def render_overview(stats: dict, open_trades: list[dict] | None = None) -> str:
     if not stats:
         return "  No completed trades in this period.\n"
+
+    pf = (f"{stats['profit_factor']:.2f}"
+          if stats['profit_factor'] != float("inf") else "inf (no losses)")
+
     lines = [
-        f"  Completed trades   : {stats['n']}",
-        f"  Wins / Losses      : {stats['n_wins']}W / {stats['n_losses']}L",
-        f"  Hit rate           : {stats['hit_rate']:.1%}",
-        f"  Total P&L (net)    : {_sign(stats['total_pnl'])} EUR",
-        f"  Average per trade  : {_sign(stats['avg_pnl'])} EUR",
-        f"  Avg win            : {_sign(stats['avg_win'])} EUR",
-        f"  Avg loss           : {_sign(stats['avg_loss'])} EUR",
-        f"  Profit factor      : {stats['profit_factor']:.2f}"
-            if stats['profit_factor'] != float('inf')
-            else "  Profit factor      : inf (no losses)",
-        f"  Best trade         : {stats['best_trade'].get('ticker','?'):10s}  "
-            f"{_sign(stats['best_pnl'])} EUR",
-        f"  Worst trade        : {stats['worst_trade'].get('ticker','?'):10s}  "
-            f"{_sign(stats['worst_pnl'])} EUR",
+        f"  Trades completed   : {stats['n']}  "
+            f"({stats['n_wins']}W / {stats['n_losses']}L  "
+            f"hit rate {stats['hit_rate']:.1%})",
+        sep(),
+        f"  Total P&L (net)    : {_sign(stats['total_pnl'])} EUR"
+            f"   ({_pct(stats['roic'])} on capital deployed)",
+        f"  Commissions paid   : -{stats['total_commission']:.2f} EUR"
+            f"   ({stats['total_commission'] / stats['n']:.2f} EUR avg/trade)",
+        f"  Capital deployed   : {stats['total_invested']:,.0f} EUR total",
+        sep(),
+        f"  Avg return/trade   : {_pct(stats['avg_return_pct'])} net"
+            f"   ({_sign(stats['avg_pnl'])} EUR)",
+        f"  Avg win            : {_pct(stats['avg_win_pct'])}"
+            f"   |  Avg loss: {_pct(stats['avg_loss_pct'])}",
+        f"  Profit factor      : {pf}",
+        sep(),
+        f"  Best trade         : {stats['best_trade'].get('ticker','?'):10s}"
+            f"  {_pct(stats['best_return_pct']):>8}  ({_sign(stats['best_pnl'])} EUR)",
+        f"  Worst trade        : {stats['worst_trade'].get('ticker','?'):10s}"
+            f"  {_pct(stats['worst_return_pct']):>8}  ({_sign(stats['worst_pnl'])} EUR)",
     ]
     if open_trades is not None:
         lines.append(f"  Currently open     : {len(open_trades)} position(s)")
@@ -164,28 +230,38 @@ def render_overview(stats: dict, open_trades: list[dict] | None = None) -> str:
 def render_trades_table(trades: list[dict]) -> str:
     if not trades:
         return "  (none)"
-    hdr = (f"  {'Date':10}  {'Ticker':8}  {'Dir':4}  {'Alert':22}  "
-           f"{'Entry':8}  {'Exit':8}  {'P&L':>9}  Result")
+    hdr = (f"  {'Date':10}  {'Ticker':8}  {'Alert':20}  "
+           f"{'Invested':>10}  {'Net P&L':>9}  {'Return%':>8}  {'Exit':4}  Result")
     rows = [sep(), hdr, sep()]
     for t in trades:
-        pnl    = t.get("pnl_net") or 0
+        pnl  = t.get("pnl_net") or 0
+        ret  = _return_pct(t)
+        comm = _commission(t)
+        inv  = _invested(t)
         result = "WIN " if pnl > 0 else "LOSS"
-        exit_reason = ""
-        if t.get("take_profit") and t.get("exit_price"):
-            if abs(t["exit_price"] - t["take_profit"]) < 0.05:
-                exit_reason = " (TP)"
-            elif t.get("stop_loss") and abs(t["exit_price"] - t["stop_loss"]) < 0.05:
-                exit_reason = " (SL)"
+        ret_str = _pct(ret) if ret is not None else "  n/a  "
         rows.append(
             f"  {str(t.get('date',''))[:10]:10}  "
             f"{str(t.get('ticker','?'))[:8]:8}  "
-            f"{str(t.get('trade_direction',''))[:4]:4}  "
-            f"{str(t.get('alert_name',''))[:22]:22}  "
-            f"{(t.get('entry_price') or 0):8.2f}  "
-            f"{(t.get('exit_price') or 0):8.2f}  "
+            f"{str(t.get('alert_name',''))[:20]:20}  "
+            f"{inv:>10,.0f}  "
             f"{_sign(pnl):>9}  "
-            f"{result}{exit_reason}"
+            f"{ret_str:>8}  "
+            f"{_exit_label(t):4}  "
+            f"{result}  (comm {comm:.2f})"
         )
+    rows.append(sep())
+    # Commission total line
+    total_comm = sum(_commission(t) for t in trades)
+    total_pnl  = sum(t.get("pnl_net") or 0 for t in trades)
+    total_inv  = sum(_invested(t) for t in trades)
+    rows.append(
+        f"  {'TOTAL':10}  {'':8}  {'':20}  "
+        f"{total_inv:>10,.0f}  "
+        f"{_sign(total_pnl):>9}  "
+        f"{_pct(total_pnl / total_inv) if total_inv else '':>8}  "
+        f"      comm total: {total_comm:.2f} EUR"
+    )
     rows.append(sep())
     return "\n".join(rows)
 
@@ -193,21 +269,22 @@ def render_trades_table(trades: list[dict]) -> str:
 def render_by_ticker(ticker_stats: dict[str, dict]) -> str:
     if not ticker_stats:
         return "  (none)"
-    sorted_items = sorted(ticker_stats.items(),
-                          key=lambda x: x[1].get("total_pnl", 0), reverse=True)
-    max_abs = max(abs(s.get("total_pnl", 0)) for _, s in sorted_items) or 1
-    lines = [sep(), f"  {'Ticker':10}  {'Trades':6}  {'W/L':6}  "
-             f"{'Hit%':6}  {'Total P&L':>10}  {'Avg':>8}"]
-    lines.append(sep())
-    for ticker, s in sorted_items:
-        bar = _bar(s["total_pnl"], max_abs, width=12,
-                   char="+" if s["total_pnl"] >= 0 else "-")
+    items = sorted(ticker_stats.items(),
+                   key=lambda x: x[1].get("avg_return_pct", 0), reverse=True)
+    max_abs = max(abs(s.get("avg_return_pct", 0)) for _, s in items) or 1
+    lines = [sep(),
+             f"  {'Ticker':10}  {'N':3}  {'W/L':6}  {'Hit%':5}  "
+             f"{'Avg%net':>8}  {'Total EUR':>10}  {'TotalComm':>9}",
+             sep()]
+    for ticker, s in items:
+        bar = _bar(s["avg_return_pct"], max_abs)
         lines.append(
-            f"  {ticker:10}  {s['n']:6}  "
+            f"  {ticker:10}  {s['n']:3}  "
             f"{s['n_wins']}W/{s['n_losses']}L  "
-            f"{s['hit_rate']:5.0%}  "
+            f"{s['hit_rate']:4.0%}  "
+            f"{_pct(s['avg_return_pct']):>8}  "
             f"{_sign(s['total_pnl']):>10}  "
-            f"{_sign(s['avg_pnl']):>8}  {bar}"
+            f"{s['total_commission']:>9.2f}  {bar}"
         )
     lines.append(sep())
     return "\n".join(lines)
@@ -216,18 +293,20 @@ def render_by_ticker(ticker_stats: dict[str, dict]) -> str:
 def render_by_alert(alert_stats: dict[str, dict]) -> str:
     if not alert_stats:
         return "  (none)"
-    sorted_items = sorted(alert_stats.items(),
-                          key=lambda x: x[1].get("total_pnl", 0), reverse=True)
-    lines = [sep(), f"  {'Alert type':26}  {'N':4}  {'W/L':6}  "
-             f"{'Hit%':5}  {'Total':>9}  {'Avg':>8}"]
-    lines.append(sep())
-    for alert, s in sorted_items:
+    items = sorted(alert_stats.items(),
+                   key=lambda x: x[1].get("avg_return_pct", 0), reverse=True)
+    lines = [sep(),
+             f"  {'Alert type':24}  {'N':3}  {'W/L':6}  {'Hit%':5}  "
+             f"{'Avg%net':>8}  {'Total EUR':>10}  {'TotalComm':>9}",
+             sep()]
+    for alert, s in items:
         lines.append(
-            f"  {alert[:26]:26}  {s['n']:4}  "
+            f"  {alert[:24]:24}  {s['n']:3}  "
             f"{s['n_wins']}W/{s['n_losses']}L  "
             f"{s['hit_rate']:4.0%}  "
-            f"{_sign(s['total_pnl']):>9}  "
-            f"{_sign(s['avg_pnl']):>8}"
+            f"{_pct(s['avg_return_pct']):>8}  "
+            f"{_sign(s['total_pnl']):>10}  "
+            f"{s['total_commission']:>9.2f}"
         )
     lines.append(sep())
     return "\n".join(lines)
@@ -237,22 +316,31 @@ def render_open_positions(open_trades: list[dict]) -> str:
     if not open_trades:
         return "  (none)"
     lines = [sep(),
-             f"  {'Ticker':10}  {'Dir':4}  {'Alert':22}  {'Entry':8}  {'SL':8}  {'TP':8}",
+             f"  {'Ticker':10}  {'Alert':22}  {'Invested':>10}  "
+             f"{'Entry':8}  {'SL':8}  {'TP':8}  SL%   TP%",
              sep()]
     for t in open_trades:
+        ep  = t.get("entry_price") or 0
+        sl  = t.get("stop_loss") or 0
+        tp  = t.get("take_profit") or 0
+        inv = _invested(t)
+        sl_pct = (sl - ep) / ep if ep else 0
+        tp_pct = (tp - ep) / ep if ep else 0
         lines.append(
             f"  {str(t.get('ticker','?'))[:10]:10}  "
-            f"{str(t.get('trade_direction',''))[:4]:4}  "
             f"{str(t.get('alert_name',''))[:22]:22}  "
-            f"{(t.get('entry_price') or 0):8.2f}  "
-            f"{(t.get('stop_loss') or 0):8.2f}  "
-            f"{(t.get('take_profit') or 0):8.2f}"
+            f"{inv:>10,.0f}  "
+            f"{ep:8.2f}  {sl:8.2f}  {tp:8.2f}  "
+            f"{_pct(sl_pct)}  {_pct(tp_pct)}"
         )
+    lines.append(sep())
+    total_exp = sum(_invested(t) for t in open_trades)
+    lines.append(f"  Total exposure: {total_exp:,.0f} EUR across {len(open_trades)} positions")
     lines.append(sep())
     return "\n".join(lines)
 
 
-# ── Report sections ────────────────────────────────────────────────────────────
+# ── Report assembly ────────────────────────────────────────────────────────────
 
 def report_period(db: str, label: str, start: date, end: date,
                   show_open: bool = False) -> str:
@@ -264,24 +352,23 @@ def report_period(db: str, label: str, start: date, end: date,
 
     sections = [header(label)]
 
-    sections.append("\n  OVERVIEW\n" + sep("-"))
+    sections.append("\n  OVERVIEW\n" + sep())
     sections.append(render_overview(stats, open_trades))
 
     if show_open and open_trades:
-        sections.append("\n  OPEN POSITIONS\n" + sep("-"))
+        sections.append("\n  OPEN POSITIONS\n" + sep())
         sections.append(render_open_positions(open_trades))
 
     if trades:
-        sections.append("\n  COMPLETED TRADES\n" + sep("-"))
+        sections.append("\n  COMPLETED TRADES\n" + sep())
         sections.append(render_trades_table(trades))
 
-        sections.append("\n  BY STOCK\n" + sep("-"))
+        sections.append("\n  BY STOCK\n" + sep())
         sections.append(render_by_ticker(ticker_s))
 
-        sections.append("\n  BY ALERT TYPE\n" + sep("-"))
+        sections.append("\n  BY SIGNAL TYPE\n" + sep())
         sections.append(render_by_alert(alert_s))
 
-        # Stocks traded list
         tickers_traded = sorted({t["ticker"] for t in trades})
         sections.append(f"\n  STOCKS TRADED: {', '.join(tickers_traded)}")
 
@@ -290,53 +377,48 @@ def report_period(db: str, label: str, start: date, end: date,
 
 def report_daily(db: str, for_date: date | None = None) -> str:
     d = for_date or date.today()
-    label = f"DAILY REPORT  -  {d.strftime('%A, %d %B %Y')}"
-    return report_period(db, label, d, d, show_open=True)
+    return report_period(db, f"DAILY REPORT  -  {d.strftime('%A, %d %B %Y')}",
+                         d, d, show_open=True)
 
 
 def report_weekly(db: str, ref: date | None = None) -> str:
-    d    = ref or date.today()
-    mon  = d - timedelta(days=d.weekday())
-    sun  = mon + timedelta(days=6)
-    label = f"WEEKLY REPORT  -  Week {mon.strftime('%d %b')} to {sun.strftime('%d %b %Y')}"
-    return report_period(db, label, mon, sun)
+    d   = ref or date.today()
+    mon = d - timedelta(days=d.weekday())
+    sun = mon + timedelta(days=6)
+    return report_period(db, f"WEEKLY REPORT  -  {mon.strftime('%d %b')} to {sun.strftime('%d %b %Y')}",
+                         mon, sun)
 
 
 def report_monthly(db: str, ref: date | None = None) -> str:
     d     = ref or date.today()
     start = d.replace(day=1)
-    # last day of month
-    if d.month == 12:
-        end = d.replace(day=31)
-    else:
-        end = d.replace(month=d.month + 1, day=1) - timedelta(days=1)
-    label = f"MONTHLY REPORT  -  {d.strftime('%B %Y')}"
-    return report_period(db, label, start, end)
+    end   = (d.replace(month=d.month + 1, day=1) - timedelta(days=1)
+             if d.month < 12 else d.replace(day=31))
+    return report_period(db, f"MONTHLY REPORT  -  {d.strftime('%B %Y')}", start, end)
 
 
 def report_all(db: str) -> str:
     with _conn(db) as conn:
         first = conn.execute(
-            "SELECT MIN(date) FROM trades WHERE exit_price IS NOT NULL"
+            "SELECT MIN(date) FROM trades WHERE exit_price IS NOT NULL AND pnl_net IS NOT NULL"
         ).fetchone()[0]
     if not first:
         return "No completed trades found."
     start = date.fromisoformat(first)
-    end   = date.today()
-    label = f"ALL-TIME REPORT  -  {start} to {end}"
-    return report_period(db, label, start, end)
+    return report_period(db, f"ALL-TIME REPORT  -  {start} to {date.today()}",
+                         start, date.today())
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="Trading performance report")
-    parser.add_argument("--today",  action="store_true", help="Today's report (default)")
-    parser.add_argument("--week",   action="store_true", help="This week's report")
-    parser.add_argument("--month",  action="store_true", help="This month's report")
-    parser.add_argument("--all",    action="store_true", help="All-time report")
-    parser.add_argument("--date",   type=str,            help="Specific date YYYY-MM-DD")
-    parser.add_argument("--db",     type=str, default=DB_PATH, help="Path to journal.db")
+    parser.add_argument("--today",  action="store_true")
+    parser.add_argument("--week",   action="store_true")
+    parser.add_argument("--month",  action="store_true")
+    parser.add_argument("--all",    action="store_true")
+    parser.add_argument("--date",   type=str, help="YYYY-MM-DD")
+    parser.add_argument("--db",     type=str, default=DB_PATH)
     args = parser.parse_args()
 
     db = args.db
@@ -345,8 +427,7 @@ def main():
         return
 
     if args.date:
-        d = date.fromisoformat(args.date)
-        print(report_daily(db, for_date=d))
+        print(report_daily(db, for_date=date.fromisoformat(args.date)))
     elif args.week:
         print(report_weekly(db))
     elif args.month:
@@ -354,9 +435,7 @@ def main():
     elif args.all:
         print(report_all(db))
     else:
-        # Default: today
         print(report_daily(db))
-
     print()
 
 
