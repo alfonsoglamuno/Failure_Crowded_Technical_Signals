@@ -273,22 +273,42 @@ def render_overview(stats: dict, open_trades: list[dict] | None = None,
             price_detail = (f"  ({base_price:.1f} → {end_price:.1f})"
                             if base_price and end_price else "")
             idx_line = f"\n  Euro STOXX 50      : {_pct(index_ret)}{price_detail}  (no agent trades to compare)"
-        open_line = f"\n  Currently open     : {len(open_trades)} position(s)" if open_trades else ""
+        open_exp = sum(_invested(t) for t in open_trades) if open_trades else 0
+        open_line = ""
+        if open_trades:
+            open_line = (f"\n  Currently open     : {len(open_trades)} position(s)"
+                         f"  |  exposure: {open_exp:,.0f} EUR")
         return f"  No completed trades in this period.{idx_line}{open_line}\n"
 
     pf = (f"{stats['profit_factor']:.2f}"
           if stats['profit_factor'] != float("inf") else "inf (no losses)")
+
+    open_exp = sum(_invested(t) for t in open_trades) if open_trades else 0
+    total_at_work = stats['total_invested'] + open_exp
 
     lines = [
         f"  Trades completed   : {stats['n']}  "
             f"({stats['n_wins']}W / {stats['n_losses']}L  "
             f"hit rate {stats['hit_rate']:.1%})",
         sep(),
+        f"  Capital deployed   : {stats['total_invested']:,.0f} EUR  "
+            f"(closed)   |   avg position: {stats['total_invested'] / stats['n']:,.0f} EUR",
+    ]
+    if open_trades:
+        lines.append(
+            f"  Open exposure      : {open_exp:,.0f} EUR  "
+            f"({len(open_trades)} position(s))"
+        )
+        lines.append(
+            f"  Total at work      : {total_at_work:,.0f} EUR  "
+            f"(closed + open)"
+        )
+    lines += [
+        sep(),
         f"  Total P&L (net)    : {_sign(stats['total_pnl'])} EUR"
-            f"   ({_pct(stats['roic'])} on capital deployed)",
+            f"   ({_pct(stats['roic'])} ROIC on capital deployed)",
         f"  Commissions paid   : -{stats['total_commission']:.2f} EUR"
             f"   ({stats['total_commission'] / stats['n']:.2f} EUR avg/trade)",
-        f"  Capital deployed   : {stats['total_invested']:,.0f} EUR total",
         sep(),
         render_benchmark(stats['roic'], index_ret, base_price, end_price),
         sep(),
@@ -304,7 +324,8 @@ def render_overview(stats: dict, open_trades: list[dict] | None = None,
             f"  {_pct(stats['worst_return_pct']):>8}  ({_sign(stats['worst_pnl'])} EUR)",
     ]
     if open_trades is not None:
-        lines.append(f"  Currently open     : {len(open_trades)} position(s)")
+        lines.append(f"  Currently open     : {len(open_trades)} position(s)"
+                     + (f"  |  exposure: {open_exp:,.0f} EUR" if open_exp else ""))
     return "\n".join(lines)
 
 
