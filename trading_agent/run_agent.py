@@ -225,9 +225,19 @@ def _variant_paths(model_dir: Path, variant: str) -> tuple[Path, Path]:
 def _apply_variant(cfg: dict, variant: str) -> None:
     """Rewrite model paths in cfg based on variant name. Exits if not found.
 
-    Also auto-configures allow_short and follow_disabled from the variant suffix:
-      _longonly  → allow_short=False, follow_disabled=True  (fade long-only)
-      _both      → allow_short=True,  follow_disabled=False (fade+follow, both dirs)
+    The variant name encodes two independent axes:
+      horizon  : h1d / h3d / h5d — how long the model was trained to predict
+      mode     : _both / _longonly — whether the model scored both alert
+                 directions during training, or only long-side alerts
+
+    Execution restrictions (allow_short, follow_disabled) are controlled
+    separately by the strategy config, NOT forced by the variant:
+      - _longonly variants hard-enforce allow_short=False and follow_disabled=True
+        because the model was never trained to score short entries.
+      - _both variants leave allow_short / follow_disabled at whatever the
+        config says.  This lets you use the better-calibrated _both model
+        (more signals, higher AUC) while still trading long-only by keeping
+        allow_short=false in config.
     """
     model_dir = Path(cfg["model"]["path"]).parent
     model_path, cols_path = _variant_paths(model_dir, variant)
@@ -242,15 +252,18 @@ def _apply_variant(cfg: dict, variant: str) -> None:
     cfg["model"]["path"]              = str(model_path)
     cfg["model"]["feature_cols_path"] = str(cols_path)
 
-    # Auto-configure direction mode from variant suffix
-    if variant.endswith("_both"):
-        cfg["strategy"]["allow_short"]     = True
-        cfg["strategy"]["follow_disabled"] = False
-        log.info("Variant %s → allow_short=True  follow_disabled=False", variant)
-    elif variant.endswith("_longonly"):
+    if variant.endswith("_longonly"):
+        # Hard restrictions: longonly model was never trained on short entries
         cfg["strategy"]["allow_short"]     = False
         cfg["strategy"]["follow_disabled"] = True
         log.info("Variant %s → allow_short=False  follow_disabled=True", variant)
+    elif variant.endswith("_both"):
+        # Execution mode stays as configured — _both only describes the model.
+        # allow_short and follow_disabled are read from config/learner state.
+        log.info("Variant %s → allow_short=%s  follow_disabled=%s (from config)",
+                 variant,
+                 cfg["strategy"].get("allow_short", False),
+                 cfg["strategy"].get("follow_disabled", True))
     else:
         log.warning("Unrecognised variant suffix in '%s' — "
                     "allow_short/follow_disabled not changed", variant)
