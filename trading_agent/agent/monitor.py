@@ -102,6 +102,93 @@ class PositionMonitor:
                 trade.get("ticker"), entry_price, exit_price, pnl_net,
             )
 
+    # ── Full account reconciliation ────────────────────────────────────────
+
+    def _check_unknown_positions(self, cfg: dict, account: str = "") -> None:
+        """
+        Compare IBKR actual positions against journal-tracked positions.
+
+        For every position that exists in IBKR but NOT in the journal:
+          - Log a prominent WARNING so the operator is aware.
+          - Longs with no protective stop: place a conservative standalone SL
+            (default SL%) so they are never left naked.
+          - Shorts: log as accidental — they should not exist when allow_short=False.
+
+        This covers positions opened manually via TWS/IB Gateway, positions
+        that survived a crash before the journal entry was written, or any
+        other out-of-band activity.
+        """
+        allow_short = cfg["strategy"].get("allow_short", False)
+        default_sl  = cfg["risk"].get("stop_loss_pct", 0.015)
+
+        ibkr_positions = {
+            pos.contract.symbol: pos
+            for pos in self.ib.positions()
+            if abs(pos.position) > 0
+        }
+        if not ibkr_positions:
+            return
+
+        journal_symbols = {
+            t.get("ibkr_symbol", "")
+            for t in self._get_open_journal_trades()
+        }
+
+        # Active open orders keyed by symbol — to detect existing stops
+        self.ib.reqAllOpenOrders()
+        self.ib.sleep(1)
+        symbols_with_orders: set[str] = {
+            getattr(t.contract, "symbol", "")
+            for t in self.ib.trades()
+            if t.orderStatus.status not in ("Filled", "Cancelled", "Inactive")
+        }
+
+        for sym, pos in ibkr_positions.items():
+            qty = int(pos.position)
+            if sym in journal_symbols:
+                continue  # known position — managed normally by monitor_positions
+
+            ccy      = getattr(pos.contract, "currency", "EUR")
+            contract = Stock(sym, "SMART", ccy)
+
+            if qty < 0:
+                # Short position not in journal — always warn
+                log.warning(
+                    "[UNKNOWN SHORT] %s qty=%d avgCost=%.4f — NOT in journal. "
+                    "allow_short=%s. Use manage_positions.py --shorts-only to cover.",
+                    sym, qty, pos.avgCost, allow_short,
+                )
+                continue
+
+            # Long position not in journal
+            if sym in symbols_with_orders:
+                log.warning(
+                    "[UNKNOWN LONG] %s qty=%d avgCost=%.4f — NOT in journal "
+                    "(has open orders, may be protected).",
+                    sym, qty, pos.avgCost,
+                )
+            else:
+                # No orders at all — place a protective stop
+                sl_price = _tick_round(pos.avgCost * (1 - default_sl))
+                from ib_insync import StopOrder
+                sl_order = StopOrder("SELL", abs(qty), sl_price)
+                sl_order.tif = "DAY"
+                if account:
+                    sl_order.account = account
+                try:
+                    self.ib.placeOrder(contract, sl_order)
+                    log.warning(
+                        "[UNKNOWN LONG] %s qty=%d avgCost=%.4f — NOT in journal. "
+                        "No orders found. Placed protective SL @ %.4f (%.1f%%).",
+                        sym, qty, pos.avgCost, sl_price, default_sl * 100,
+                    )
+                except Exception as e:
+                    log.warning(
+                        "[UNKNOWN LONG] %s qty=%d — no journal entry, no orders, "
+                        "protective SL placement failed: %s",
+                        sym, qty, e,
+                    )
+
     # ── Active position management ─────────────────────────────────────────
 
     def monitor_positions(self, contracts_cfg: dict, feed, cfg: dict, account: str = ""):
@@ -126,6 +213,11 @@ class PositionMonitor:
           half the trail trigger, close flat — avoids dead-money drag.
           Multi-day positions are governed by their SL/TP + morning re-evaluation.
         """
+        # Reconcile IBKR actual positions against the journal.  Any position that
+        # exists in the account but is NOT tracked by the journal gets a warning
+        # and, for unprotected longs, an automatic protective stop.
+        self._check_unknown_positions(cfg, account)
+
         open_trades = self._get_open_journal_trades()
         if not open_trades:
             log.debug("No open trades to monitor")
