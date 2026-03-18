@@ -1365,16 +1365,17 @@ Model variants:
         return
 
     # ── Variant selection ─────────────────────────────────────────────────────
+    # _apply_variant is ALWAYS called so that allow_short and follow_disabled
+    # are guaranteed to match the variant suffix, even when the user keeps the
+    # config default.  Without this, a config with variant="h1d_both" but
+    # allow_short=false would silently trade in long-only mode.
     if args.variant:
         _apply_variant(cfg, args.variant)
     elif not args.no_menu and sys.stdin.isatty():
         chosen = _choose_variant_interactive(cfg)
-        if chosen != cfg["model"].get("variant"):
-            _apply_variant(cfg, chosen)
-        else:
-            log.info("Active model variant: %s (from config)", cfg["model"].get("variant"))
+        _apply_variant(cfg, chosen)
     else:
-        log.info("Active model variant: %s (from config)", cfg["model"].get("variant"))
+        _apply_variant(cfg, cfg["model"].get("variant", "h3d_longonly"))
 
     # ── Live trading confirmation ─────────────────────────────────────────────
     if args.live:

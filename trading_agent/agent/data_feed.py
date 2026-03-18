@@ -128,7 +128,7 @@ class IBKRFeed:
         """Build an IBKR Stock contract from a Yahoo Finance ticker."""
         spec = contracts_cfg.get(yahoo_ticker)
         if not spec:
-            log.warning("No IBKR contract mapping for %s", yahoo_ticker)
+            log.debug("No IBKR contract mapping for %s — yfinance used for data", yahoo_ticker)
             return None
         return Stock(spec["symbol"], spec["exchange"], spec["currency"])
 
@@ -139,7 +139,7 @@ class IBKRFeed:
         bar_size: str = "1 day",
     ) -> pd.DataFrame:
         """
-        Fetch historical daily OHLCV bars.
+        Fetch historical daily OHLCV bars from IBKR.
         Returns DataFrame with columns: date, open, high, low, close, volume.
         """
         if not self._connected:
@@ -168,6 +168,40 @@ class IBKRFeed:
         df = df[df["close"] > 0].reset_index(drop=True)
         return df
 
+    @staticmethod
+    def _fetch_yfinance_ohlcv(yahoo_ticker: str, days: int = 252) -> pd.DataFrame:
+        """
+        Fallback OHLCV fetch using yfinance.
+
+        Used when IBKR returns no data (error 200 = contract not found,
+        error 162 = no market data permissions on paper account, etc.).
+        The result is cached by the caller so this path runs at most once
+        per cache_max_age_hours window.
+        """
+        try:
+            import yfinance as yf
+            from datetime import date, timedelta
+            import pandas as _pd
+            start = date.today() - timedelta(days=days + 30)   # buffer for gaps
+            df = yf.download(yahoo_ticker, start=str(start), end=str(date.today()),
+                             progress=False, auto_adjust=True)
+            if df is None or df.empty:
+                log.warning("yfinance: no data for %s", yahoo_ticker)
+                return pd.DataFrame()
+            if isinstance(df.columns, _pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df = df.rename(columns={"Open": "open", "High": "high", "Low": "low",
+                                    "Close": "close", "Volume": "volume"})
+            df["date"] = _pd.to_datetime(df.index)
+            df = df.reset_index(drop=True)
+            df = df[["date", "open", "high", "low", "close", "volume"]].copy()
+            df = df[df["close"] > 0].reset_index(drop=True)
+            log.info("yfinance fallback: %s  %d rows", yahoo_ticker, len(df))
+            return df
+        except Exception as e:
+            log.error("yfinance fallback failed for %s: %s", yahoo_ticker, e)
+            return pd.DataFrame()
+
     def fetch_universe(
         self,
         tickers: list[str],
@@ -195,20 +229,29 @@ class IBKRFeed:
                         continue
 
             contract = self.make_contract(yahoo_ticker, contracts_cfg)
-            if contract is None:
+
+            df = pd.DataFrame()
+            if contract is not None:
+                try:
+                    df = self.fetch_ohlcv(contract, days=days)
+                except Exception as e:
+                    log.error("IBKR fetch failed for %s: %s", yahoo_ticker, e)
+
+            # yfinance fallback: used when (a) no IBKR contract mapping exists,
+            # (b) IBKR returns no data (error 200 = contract unknown, error 162 =
+            # no market data permissions on paper account), or (c) connection error.
+            # Result is cached normally so this path runs at most once per window.
+            if df.empty:
+                log.info("Trying yfinance fallback for %s", yahoo_ticker)
+                df = self._fetch_yfinance_ohlcv(yahoo_ticker, days=days)
+
+            if df.empty:
                 continue
 
-            try:
-                df = self.fetch_ohlcv(contract, days=days)
-                if df.empty:
-                    continue
-                df["ticker"] = yahoo_ticker
-                if cache:
-                    df.to_parquet(cache_file, index=False)
-                results[yahoo_ticker] = df
-                log.info("Fetched %s: %d rows", yahoo_ticker, len(df))
-            except Exception as e:
-                log.error("Failed to fetch %s: %s", yahoo_ticker, e)
+            df["ticker"] = yahoo_ticker
+            if cache:
+                df.to_parquet(cache_file, index=False)
+            results[yahoo_ticker] = df
 
         return results
 
