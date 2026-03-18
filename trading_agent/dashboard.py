@@ -55,7 +55,7 @@ def _bar(value: float, max_val: float, width: int = 20, fill: str = "#", empty: 
 def _pnl_str(v: float) -> str:
     if v is None:
         return "     --"
-    sign = "+" if v >= 0 else ""
+    sign = "+" if v >= 0 else "-"
     return f"{sign}{abs(v):.2f} EUR"
 
 
@@ -85,7 +85,7 @@ def section_summary(conn: sqlite3.Connection, cfg: dict) -> str:
     """).fetchone()
 
     open_row = conn.execute(
-        "SELECT COUNT(*) AS n FROM trades WHERE exit_price IS NULL AND status != 'error'"
+        "SELECT COUNT(*) AS n FROM trades WHERE exit_price IS NULL AND status NOT IN ('cancelled','error')"
     ).fetchone()
 
     n = row["n"] or 0
@@ -106,11 +106,22 @@ def section_summary(conn: sqlite3.Connection, cfg: dict) -> str:
     foll_dis  = cfg["strategy"].get("follow_disabled", True)
 
     learner_path = Path(cfg["model"]["path"]).parent / "learner_state.json"
+    alert_stats  = {}
     if learner_path.exists():
         with open(learner_path) as f:
             ls = json.load(f)
-        fade_thr = ls.get("fade_threshold", fade_thr)
-        foll_thr = ls.get("follow_threshold", foll_thr)
+        fade_thr    = ls.get("fade_threshold", fade_thr)
+        foll_thr    = ls.get("follow_threshold", foll_thr)
+        alert_stats = ls.get("alert_stats", {})
+
+    # Identify suppressed alert types (win rate < threshold with enough samples)
+    suppress_thr = cfg["model"].get("suppress_win_rate_threshold", 0.25)
+    min_n        = cfg["model"].get("min_trades_for_recalibration", 10)
+    suppressed_keys = [
+        k for k, v in alert_stats.items()
+        if v.get("total", 0) >= min_n
+        and (v.get("wins", 0) / v["total"]) < suppress_thr
+    ]
 
     lines = [
         _sep("="),
@@ -138,6 +149,9 @@ def section_summary(conn: sqlite3.Connection, cfg: dict) -> str:
         f"SL {cfg['risk']['stop_loss_pct']*100:.0f}% | "
         f"TP {cfg['risk']['take_profit_pct']*100:.0f}%",
     ]
+    if suppressed_keys:
+        lines.append(f"  Suppressed alerts  : {', '.join(sorted(suppressed_keys)[:4])}"
+                     + (f"  (+{len(suppressed_keys)-4} more)" if len(suppressed_keys) > 4 else ""))
     return "\n".join(lines)
 
 
@@ -242,7 +256,9 @@ def section_open_positions(conn: sqlite3.Connection) -> str:
                t.ibkr_order_id
         FROM trades t
         LEFT JOIN signals s ON t.signal_id = s.id
-        WHERE t.exit_price IS NULL AND t.status != 'error'
+        WHERE t.exit_price IS NULL
+          AND t.status NOT IN ('cancelled','error')
+          AND (s.action IS NULL OR s.action != 'SKIP')
         ORDER BY t.ts DESC
     """).fetchall()
 

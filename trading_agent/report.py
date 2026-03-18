@@ -161,6 +161,7 @@ def get_open_trades(db: str) -> list[dict]:
             LEFT JOIN signals s ON t.signal_id = s.id
             WHERE t.exit_price IS NULL
               AND t.status NOT IN ('cancelled','error')
+              AND (s.action IS NULL OR s.action != 'SKIP')
             ORDER BY t.date DESC
         """).fetchall()
     return [dict(r) for r in rows]

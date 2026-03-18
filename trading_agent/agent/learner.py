@@ -90,6 +90,34 @@ class AdaptiveLearner:
 
     # ── Outcome recording ────────────────────────────────────────────────────
 
+    def is_alert_suppressed(self, action: str, alert_name: str) -> bool:
+        """
+        Return True if this (action, alert_name) combination has a win rate
+        low enough to suppress new signals.
+
+        Gate:
+          - Requires at least min_trades_for_recalibration samples before blocking.
+          - Blocks when win rate < suppress_win_rate_threshold (default 0.25).
+          - Only applies to action types that are currently enabled
+            (FADE always eligible; FOLLOW only when not follow_disabled).
+        """
+        if action == "FOLLOW" and self.follow_disabled:
+            return False  # already disabled globally — no need for per-alert check
+        min_n     = self._min_trades
+        threshold = self.cfg["model"].get("suppress_win_rate_threshold", 0.25)
+        key       = f"{action}:{alert_name}"
+        stats     = self._alert_stats.get(key)
+        if not stats or stats.get("total", 0) < min_n:
+            return False   # not enough data yet
+        win_rate = stats["wins"] / stats["total"]
+        suppressed = win_rate < threshold
+        if suppressed:
+            log.info(
+                "Alert suppressed: %s  win=%.0f%%  n=%d  (threshold=%.0f%%)",
+                key, win_rate * 100, stats["total"], threshold * 100,
+            )
+        return suppressed
+
     def record_outcome(self, alert_name: str, action: str, pnl_net: float):
         """
         Call when a bracket order closes (TP or SL hit).

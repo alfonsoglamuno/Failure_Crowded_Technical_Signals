@@ -122,6 +122,7 @@ model:
   threshold_step_up: 0.02             # Tighten threshold when losing
   threshold_step_down: 0.01           # Loosen when winning
   win_rate_target: 0.55               # Target hit rate
+  suppress_win_rate_threshold: 0.25   # Block alert types with win rate < 25% (after min_trades samples)
 
 data:
   history_days: 2555        # 7 years of calendar days (~1785 trading days) — includes COVID 2020

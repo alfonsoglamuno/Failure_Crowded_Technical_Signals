@@ -543,10 +543,17 @@ def run_once(paper: bool, cfg: dict):
                  probas.min(), probas.max(), probas.mean())
 
         # ── Strategy + risk filter ────────────────────────────────────────────
+        # When follow_disabled=True, set follow_threshold to an impossible value
+        # so make_signals never emits FOLLOW signals.  This is the canonical way
+        # to honour the flag — P(failure) cannot be < 0, so no FOLLOW is emitted.
+        _follow_thr = (
+            0.0 if cfg["strategy"].get("follow_disabled", True)
+            else learner.follow_threshold
+        )
         signals = make_signals(
             feature_df, probas,
             fade_threshold=learner.fade_threshold,
-            follow_threshold=learner.follow_threshold,
+            follow_threshold=_follow_thr,
             horizon_days=cfg["strategy"]["default_horizon"],
             crowding_min_score=cfg["strategy"].get("crowding_min_score", 0.30),
             regime_threshold_boost=cfg["strategy"].get("regime_threshold_boost", 0.05),
@@ -556,6 +563,20 @@ def run_once(paper: bool, cfg: dict):
             max_trades=cfg["risk"]["max_trades_per_day"],
             allow_short=cfg["strategy"].get("allow_short", False),
         )
+
+        # ── Learner per-alert suppression ─────────────────────────────────────
+        # Remove signals whose (action, alert_name) pair has a sustained poor
+        # win rate (< suppress_win_rate_threshold after min_trades_for_recalibration
+        # samples). This lets the learner silence alert types that have proven
+        # unprofitable rather than waiting for a full threshold recalibration.
+        suppressed_before = len(signals)
+        signals = [
+            s for s in signals
+            if not learner.is_alert_suppressed(s.action, s.alert_name)
+        ]
+        if len(signals) < suppressed_before:
+            log.info("Learner suppressed %d signal(s) due to poor alert-type performance",
+                     suppressed_before - len(signals))
 
         # ── Log all signals (iterate feature_df rows — aligned with probas) ────
         # feature_df may have fewer rows than events (skipped tickers)
@@ -636,13 +657,14 @@ def run_once(paper: bool, cfg: dict):
         )
         n_trades = 0
 
-        # Dedup: don't re-trade a ticker that still has an active (unclosed) trade today.
-        # Includes filled trades with no exit yet (position open but SL/TP pending).
+        # Dedup: don't re-trade a ticker that was already traded today, regardless of
+        # whether the position is still open or already closed.  A second entry on the
+        # same ticker on the same day doubles concentration risk and inflates commissions.
+        # Exclude pure errors (order never submitted to IBKR) — those may legitimately retry.
         already_traded_today = {
             t["ticker"] for t in journal.get_recent_trades(100)
             if str(t.get("date", "")) == str(today)
-               and t.get("status") in ("submitted", "open", "pending", "filled")
-               and t.get("exit_price") is None
+               and t.get("status") not in ("error",)
         }
         if already_traded_today:
             log.info("Already traded today: %s — will not re-enter", sorted(already_traded_today))
