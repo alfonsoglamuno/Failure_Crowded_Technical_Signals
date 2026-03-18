@@ -19,7 +19,7 @@ Model variants (horizon x direction mode):
 Continuous intraday loop:
     - Fast cycle (5 min):  trail stops, time exits, exit sync
     - Slow cycle (30 min): full signal scan, new trades
-    - EOD close at 16:30 CET: cancel all brackets, flatten positions
+    - EOD close at 17:28 CET: cancel all brackets, flatten positions (2 min before 17:30 close)
     - Morning check: re-evaluate any overnight positions FIRST
     - Reconnect recovery: on IBKR reconnect, reconcile positions before resuming
 """
@@ -48,9 +48,11 @@ log = logging.getLogger("agent")
 
 CET = ZoneInfo("Europe/Berlin")
 
-# Euro STOXX 50 exchanges open 09:00-17:35 CET; we trade 09:10-17:00 window.
+# EUROSTOXX 50 continuous session: 09:00-17:30 CET (XETRA/SBF/AEB).
+# We start at 09:10 to skip the opening auction, and run the monitor loop
+# until 17:35 to cover the EOD flatten at 17:28 plus the post-close cycle.
 _MARKET_OPEN  = dtime(9, 10)
-_MARKET_CLOSE = dtime(17, 0)
+_MARKET_CLOSE = dtime(17, 35)
 
 # GBP-denominated tickers — kept in eurostoxx50_tickers.yaml for model data
 # but excluded from ibkr_contracts.yaml. Skip them early here to avoid a
@@ -267,6 +269,26 @@ def _apply_variant(cfg: dict, variant: str) -> None:
     else:
         log.warning("Unrecognised variant suffix in '%s' — "
                     "allow_short/follow_disabled not changed", variant)
+
+    # ── Per-horizon strategy thresholds ───────────────────────────────────────
+    # Read horizon-specific fade/follow thresholds and win_rate_target from
+    # config (strategy.h1d / h3d / h5d blocks) and apply them to top-level
+    # strategy keys so all downstream code sees the right values.
+    # These compensate for differing base failure rates across horizons:
+    #   h1d base=0.37 → threshold 0.60; h3d base=0.44 → 0.63; h5d base=0.46 → 0.65
+    horizon_key = variant[:3]   # "h1d", "h3d", or "h5d"
+    hz_cfg = cfg["strategy"].get(horizon_key, {})
+    if hz_cfg:
+        for key in ("fade_threshold", "follow_threshold", "win_rate_target"):
+            if key in hz_cfg:
+                cfg["strategy"][key] = hz_cfg[key]
+        log.info(
+            "Variant %s → fade_threshold=%.2f  follow_threshold=%.2f  win_rate_target=%.2f",
+            variant,
+            cfg["strategy"].get("fade_threshold", 0.60),
+            cfg["strategy"].get("follow_threshold", 0.40),
+            cfg["strategy"].get("win_rate_target", 0.55),
+        )
 
     log.info("Active model variant: %s", variant)
 
@@ -768,6 +790,23 @@ def run_once(paper: bool, cfg: dict):
 
         log.info("Open positions: %d/%d — %d slot(s) available",
                  len(open_ibkr_positions), max_open, slots_available)
+
+        # ── Last-entry cutoff ─────────────────────────────────────────────────
+        # Stop opening NEW positions N minutes before EOD flatten time.
+        # Existing positions are still monitored and closed normally.
+        eod_str_run     = cfg["strategy"].get("eod_close_time", "17:28")
+        cutoff_min      = cfg["strategy"].get("last_entry_cutoff_min", 10)
+        eod_h_run, eod_m_run = int(eod_str_run.split(":")[0]), int(eod_str_run.split(":")[1])
+        eod_total_min   = eod_h_run * 60 + eod_m_run
+        now_total_min   = now.hour * 60 + now.minute
+        if now_total_min >= eod_total_min - cutoff_min:
+            last_entry_str = f"{(eod_total_min - cutoff_min) // 60:02d}:{(eod_total_min - cutoff_min) % 60:02d}"
+            log.info(
+                "Past last-entry cutoff (%s CET) — skipping new entries, monitoring existing positions only",
+                last_entry_str,
+            )
+            journal.log_daily_summary(nav, daily_pnl, len(events), 0, paper, today)
+            return
 
         for sig in signals:
             # Skip GBP-quoted stocks — no contract in ibkr_contracts.yaml, EUR only

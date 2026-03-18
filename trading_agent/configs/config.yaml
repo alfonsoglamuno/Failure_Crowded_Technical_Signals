@@ -72,12 +72,43 @@ strategy:
                             # Re-enable once IBKR confirms short locates are working on live account.
   monitor_interval_min: 5   # fast loop: trail stops + time exits (every 5 min)
   scan_interval_min: 30     # slow loop: full signal scan (every 30 min)
-  eod_close_time: "16:27"   # close all positions 3 min BEFORE exchange close (CET).
-                            # Gives market orders 3 min to fill; 16:30 is too tight.
+  eod_close_time: "17:28"   # flatten ALL positions 2 min before exchange close (CET).
+                            # EUROSTOXX 50 continuous session ends 17:30 CET (XETRA/SBF/AEB).
+                            # 17:28 gives market orders 2 min to fill before auction.
+  last_entry_cutoff_min: 10 # stop opening NEW positions this many minutes before eod_close_time.
+                            # 17:28 - 10min = last new entry at 17:18 CET.
+                            # Ensures bracket orders are placed and at least one monitor
+                            # cycle runs before forced flatten.
   max_open_positions: 10    # max simultaneous open long positions
 
   # Start with FADE only — we have more data on it. Enable FOLLOW after 50 FADE trades.
   follow_disabled: true
+
+  # ── Per-horizon threshold overrides ───────────────────────────────────────────
+  # Applied by _apply_variant() at startup based on the active model horizon.
+  # Derived from backtest results (results/reports/ml_metrics.csv):
+  #
+  #   horizon  AUC    hit_rate  sharpe  base_rate  → threshold reasoning
+  #   h1d      0.605  0.561     0.938   0.372      → 0.60 = +22pp above base (baseline)
+  #   h3d      0.597  0.574     0.620   0.439      → 0.63 = same normalised lift as h1d
+  #   h5d      0.586  0.555     0.459   0.460      → 0.65 = same normalised lift as h1d
+  #
+  # Raising h3d/h5d thresholds compensates for their higher base failure rates —
+  # a raw 0.60 threshold is weaker signal for h3d/h5d than for h1d.
+  h1d:
+    fade_threshold: 0.60
+    follow_threshold: 0.40
+    win_rate_target: 0.55
+
+  h3d:
+    fade_threshold: 0.63     # higher base_rate (0.44) → need more lift to match h1d signal quality
+    follow_threshold: 0.37
+    win_rate_target: 0.57    # slightly higher — h3d hit_rate 0.574 in backtest
+
+  h5d:
+    fade_threshold: 0.65     # highest base_rate (0.46) → need most lift
+    follow_threshold: 0.35
+    win_rate_target: 0.55    # conservative — h5d sharpe 0.459, more noise
 
   # Crowding gate (Barber & Odean, 2008):
   #   Only FADE when attention conditions are elevated — vol surge, price extreme,
