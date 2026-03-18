@@ -138,10 +138,14 @@ class PositionMonitor:
             h = rec.get("hold_horizon_days") or 1
             return cfg["risk"].get(f"h{h}d", {}).get(key, cfg["risk"].get(key, default))
 
-        # Fetch active stop orders from IBKR, keyed by parentId.
+        # Fetch active stop orders from IBKR.
         # Use orderType == "STP" instead of isinstance(StopOrder) because
         # orders received from IBKR on reconnect are plain Order objects,
         # not StopOrder instances — isinstance check always returns False.
+        # Two lookup structures:
+        #   stop_trades         — bracket children keyed by parentId (same session)
+        #   standalone_stops    — restored standalone stops keyed by symbol
+        #     (placed after original bracket expired; no parentId)
         self.ib.reqAllOpenOrders()
         self.ib.sleep(1)
         stop_trades = {
@@ -151,8 +155,15 @@ class PositionMonitor:
             and getattr(t.order, "parentId", 0)
             and t.orderStatus.status not in ("Filled", "Cancelled", "Inactive")
         }
-        log.info("Active stop orders tracked: %d  |  Open journal trades: %d",
-                 len(stop_trades), len(open_trades))
+        standalone_stops = {
+            t.contract.symbol: t
+            for t in self.ib.trades()
+            if getattr(t.order, "orderType", "") == "STP"
+            and not getattr(t.order, "parentId", 0)
+            and t.orderStatus.status not in ("Filled", "Cancelled", "Inactive")
+        }
+        log.info("Active stop orders tracked: %d bracket + %d standalone  |  Open journal trades: %d",
+                 len(stop_trades), len(standalone_stops), len(open_trades))
 
         for rec in open_trades:
             ticker    = rec.get("ticker", "")
@@ -207,7 +218,11 @@ class PositionMonitor:
             # ── Ensure SL exists ──────────────────────────────────────────
             # If position has NO active stop order, re-place one.
             # This protects naked positions after bracket cancellation or reconnect.
-            if parent_id not in stop_trades:
+            # Check both bracket-child stops (by parentId) and standalone stops
+            # (by symbol) so we don't place a second stop when one already exists.
+            ibkr_symbol = spec["symbol"]
+            has_stop = (parent_id in stop_trades) or (ibkr_symbol in standalone_stops)
+            if not has_stop:
                 sl_pct = _risk(rec, "stop_loss_pct", 0.015)
                 if direction == "BUY":
                     sl_price = _tick_round(current_px * (1 - sl_pct))
@@ -219,8 +234,10 @@ class PositionMonitor:
                 if qty > 0:
                     sl_action = "SELL" if direction == "BUY" else "BUY"
                     sl_order = StopOrder(sl_action, qty, sl_price)
-                    sl_order.tif      = exit_tif   # DAY for h1d, GTC for h3d/h5d
-                    sl_order.parentId = parent_id
+                    sl_order.tif = exit_tif   # DAY for h1d, GTC for h3d/h5d
+                    # No parentId — the original bracket parent (DAY order) has
+                    # expired. This is a standalone stop, not a bracket child.
+                    # Setting parentId to an expired order causes IBKR Error 135.
                     if account:
                         sl_order.account = account
                     try:
@@ -233,8 +250,8 @@ class PositionMonitor:
 
             # ── Trailing stop ──────────────────────────────────────────────
             if unrealized_pct >= trail_trigger:
-                if parent_id in stop_trades:
-                    sl_trade   = stop_trades[parent_id]
+                sl_trade = stop_trades.get(parent_id) or standalone_stops.get(ibkr_symbol)
+                if sl_trade is not None:
                     current_sl = sl_trade.order.auxPrice
 
                     if direction == "BUY":

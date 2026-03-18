@@ -978,11 +978,20 @@ def _evaluate_overnight_positions(paper: bool, cfg: dict):
 
         ib.reqAllOpenOrders()
         ib.sleep(1)
+        # Bracket child stops keyed by parentId (same-session bracket orders)
         existing_stops = {
             t.order.parentId: t.order.auxPrice
             for t in ib.trades()
             if getattr(t.order, "orderType", "") == "STP"
             and getattr(t.order, "parentId", 0)
+            and t.orderStatus.status not in ("Filled", "Cancelled", "Inactive")
+        }
+        # Standalone stops (restored after bracket expiry) keyed by symbol
+        standalone_stop_symbols = {
+            t.contract.symbol
+            for t in ib.trades()
+            if getattr(t.order, "orderType", "") == "STP"
+            and not getattr(t.order, "parentId", 0)
             and t.orderStatus.status not in ("Filled", "Cancelled", "Inactive")
         }
 
@@ -1072,10 +1081,18 @@ def _evaluate_overnight_positions(paper: bool, cfg: dict):
                 continue
 
             # ── Case 5 & 6: SL active — just log ──────────────────────────
+            # Check both bracket-child stops (keyed by parentId) and standalone
+            # stops (restored after bracket expiry, keyed by symbol).
             if parent_id in existing_stops:
                 log.info(
                     "Overnight %s: SL active @ %.4f  P&L=%.1f%%  held=%dd",
                     ticker, existing_stops[parent_id], profit_pct * 100, days_held,
+                )
+                continue
+            if symbol in standalone_stop_symbols:
+                log.info(
+                    "Overnight %s: standalone SL active  P&L=%.1f%%  held=%dd",
+                    ticker, profit_pct * 100, days_held,
                 )
                 continue
 
@@ -1105,7 +1122,8 @@ def _evaluate_overnight_positions(paper: bool, cfg: dict):
 
             sl_order.account  = account
             sl_order.tif      = "DAY"
-            sl_order.parentId = parent_id
+            # No parentId — the original bracket parent (DAY order) has expired.
+            # This is a standalone stop, not a bracket child.
             ib.placeOrder(contract, sl_order)
             log.warning(
                 "Overnight %s: SL re-placed @ %.4f  [%s]  held=%dd",

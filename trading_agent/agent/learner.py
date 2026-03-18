@@ -181,8 +181,8 @@ class AdaptiveLearner:
         wins = sum(1 for t in completed if (t.get("pnl_net") or 0) > 0)
         total_pnl = sum(t.get("pnl_net") or 0 for t in completed)
         log.info(
-            "─── Learner: %d trades  hit=%.1f%%  pnl=%.2f EUR"
-            "  fade_thr=%.3f  follow_thr=%.3f ───",
+            "--- Learner: %d trades  hit=%.1f%%  pnl=%.2f EUR"
+            "  fade_thr=%.3f  follow_thr=%.3f ---",
             n, wins / n * 100, total_pnl,
             self.fade_threshold, self.follow_threshold,
         )

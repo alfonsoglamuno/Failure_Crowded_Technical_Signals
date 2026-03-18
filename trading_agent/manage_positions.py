@@ -78,9 +78,12 @@ def run(
     ib   = feed.ib
     account = feed.account_id
 
-    ib.sleep(2)  # allow IBKR to push full position data
+    ib.sleep(2)  # allow IBKR to push full position + portfolio data
 
-    all_positions = [p for p in ib.positions() if abs(p.position) > 0]
+    # ib.portfolio() returns PortfolioItem(contract, position, marketPrice,
+    # marketValue, averageCost, unrealizedPNL, realizedPNL, account)
+    # which has averageCost and unrealizedPNL — unlike ib.positions().
+    all_positions = [p for p in ib.portfolio() if abs(p.position) > 0]
     if not all_positions:
         print("No open positions.")
         feed.disconnect()
