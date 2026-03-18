@@ -741,9 +741,12 @@ def run_once(paper: bool, cfg: dict):
                         open_ibkr_positions.add(yahoo)
 
             # Pending / live parent orders (not yet filled)
+            # "Filled" is intentionally excluded — a filled parent order means the
+            # entry executed, but the position may have since been closed by SL/TP.
+            # Actual open positions are already captured by feed.ib.positions() above.
             for trade in feed.ib.trades():
                 status = trade.orderStatus.status
-                if status in ("PendingSubmit", "Submitted", "PreSubmitted", "Filled"):
+                if status in ("PendingSubmit", "Submitted", "PreSubmitted"):
                     if not getattr(trade.order, "parentId", 0):  # parent orders only
                         yahoo = symbol_to_yahoo.get(trade.contract.symbol, "")
                         if yahoo:
