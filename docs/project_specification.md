@@ -129,7 +129,7 @@ For an alert on day `t` with horizon `h` and threshold `θ = 0.005` (0.5%):
 
 **Why 0.5%?** Captures economically meaningful reversals after commission (0.10% round-trip), while filtering pure noise moves.
 
-**Base rate**: ~37–47% failure rate depending on horizon. The model does not need a 50%+ base rate — it only needs to identify a subset where failure probability is meaningfully above base rate.
+**Base rate**: ~37-47% failure rate depending on horizon. The model does not need a 50%+ base rate — it only needs to identify a subset where failure probability is meaningfully above base rate.
 
 ---
 

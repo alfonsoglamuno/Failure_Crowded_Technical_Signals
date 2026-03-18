@@ -2,7 +2,7 @@
 
 ## Core Question
 
-> Given a visible chart alert (breakout, RSI extreme, MACD cross, abnormal volume) on a EURO STOXX 50 stock — and the surrounding market context — what is the probability that this alert will **fail to follow through** over the next 1–5 sessions?
+> Given a visible chart alert (breakout, RSI extreme, MACD cross, abnormal volume) on a EURO STOXX 50 stock — and the surrounding market context — what is the probability that this alert will **fail to follow through** over the next 1-5 sessions?
 
 The model does not predict price direction. It predicts **signal reliability conditioned on context**. A bearish signal that fires into a high-correlation, high-momentum, high-volume environment has very different failure odds than the same signal in an idiosyncratic, low-crowding environment.
 

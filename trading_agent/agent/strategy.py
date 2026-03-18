@@ -22,7 +22,7 @@ Decision logic (informed by literature):
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import pandas as pd
 

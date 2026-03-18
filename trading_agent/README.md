@@ -126,7 +126,7 @@ Pre-COVID / COVID / Recovery / Recent windows, feature importance, calibration c
 | Block | Name | Key features |
 |-------|------|-------------|
 | A | Alert | type, direction, simultaneous count |
-| B | Price state | returns 1–20d, MA distance, 20d range position |
+| B | Price state | returns 1-20d, MA distance, 20d range position |
 | C | Volatility / cost | ATR, realized vol, atr_vs_commission (gate for tight stocks) |
 | D | Volume / attention | volume z-score, returnxvolume interaction, streak counts |
 | E | Market regime | index trend, beta, correlation, relative strength vs index |

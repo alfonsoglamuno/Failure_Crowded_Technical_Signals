@@ -242,7 +242,6 @@ def _choose_variant_interactive(cfg: dict) -> str:
     Interactive startup menu — shown when --variant is not passed and stdin
     is a terminal.  Returns the chosen variant name.
     """
-    import sys as _sys
     model_dir = Path(cfg["model"]["path"]).parent
     current   = cfg["model"].get("variant", "h3d_longonly")
 

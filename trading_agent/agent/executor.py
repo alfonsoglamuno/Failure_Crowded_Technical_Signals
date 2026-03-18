@@ -8,7 +8,7 @@ import logging
 from dataclasses import dataclass
 from typing import Optional
 
-from ib_insync import IB, Stock, MarketOrder, LimitOrder, StopOrder, BracketOrder
+from ib_insync import IB, Stock, MarketOrder, LimitOrder, StopOrder
 
 log = logging.getLogger(__name__)
 

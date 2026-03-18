@@ -167,8 +167,7 @@ def run_checks(paper: bool) -> bool:
     check(f"Cache directory", cache_dir.exists(), str(cache_dir))
     check(f"Cached tickers", len(cached) > 0, f"{len(cached)} parquet files")
 
-    from pathlib import Path as P
-    db_path = P(cfg["journal"]["db_path"])
+    db_path = Path(cfg["journal"]["db_path"])
     check("Journal DB", db_path.exists(),
           str(db_path) if db_path.exists() else "will be created on first run")
 

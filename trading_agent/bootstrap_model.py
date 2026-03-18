@@ -383,7 +383,7 @@ def main(paper: bool = True, use_yfinance: bool = False,
              labeled["label_failure_3d"].mean(),
              labeled["label_failure_5d"].mean())
 
-    # ── Step 4–5: Train all requested variants ────────────────────────────────
+    # ── Step 4-5: Train all requested variants ────────────────────────────────
     model_dir = Path(cfg["model"]["path"]).parent
     model_dir.mkdir(parents=True, exist_ok=True)
 
