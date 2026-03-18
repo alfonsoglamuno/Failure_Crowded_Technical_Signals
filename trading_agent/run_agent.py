@@ -320,6 +320,8 @@ def _reconnect_evaluate(paper: bool, cfg: dict) -> None:
             commission=cfg["risk"]["commission_per_trade_eur"],
             commission_rate=cfg["risk"].get("commission_rate_pct", 0.05) / 100,
             commission_min=cfg["risk"].get("commission_min_eur", 2.0),
+            paper=paper,
+            account_id=feed.account_id,
         )
         # Step 1: catch any fills that arrived while we were offline
         monitor.check_exits()
@@ -431,6 +433,15 @@ def run_once(paper: bool, cfg: dict):
         log.error("IBKR connection failed: %s", e)
         return
 
+    # ── Account / mode banner ─────────────────────────────────────────────────
+    mode_str = "PAPER" if paper else "*** LIVE — REAL MONEY ***"
+    log.info("=" * 60)
+    log.info("  MODE    : %s", mode_str)
+    log.info("  ACCOUNT : %s", feed.account_id)
+    log.info("  VARIANT : %s  (allow_short=%s)", _active_variant,
+             cfg["strategy"].get("allow_short", False))
+    log.info("=" * 60)
+
     try:
         # ── Cancel stale PreSubmitted DAY orders from previous sessions ──────
         # IBKR paper sometimes fails to auto-expire DAY market orders for exotic
@@ -454,7 +465,8 @@ def run_once(paper: bool, cfg: dict):
 
         # ── Check exits from previous bracket orders ──────────────────────────
         monitor = PositionMonitor(feed.ib, journal, learner,
-                                  commission=cfg["risk"]["commission_per_trade_eur"])
+                                  commission=cfg["risk"]["commission_per_trade_eur"],
+                                  paper=paper, account_id=feed.account_id)
         monitor.check_exits()
 
         nav = feed.get_nav()
@@ -909,6 +921,8 @@ def _monitor_open_positions(paper: bool, cfg: dict):
             commission=cfg["risk"]["commission_per_trade_eur"],
             commission_rate=cfg["risk"].get("commission_rate_pct", 0.05) / 100,
             commission_min=cfg["risk"].get("commission_min_eur", 2.0),
+            paper=paper,
+            account_id=feed.account_id,
         )
         monitor.check_exits()
         monitor.monitor_positions(

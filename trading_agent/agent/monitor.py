@@ -30,16 +30,25 @@ class PositionMonitor:
     def __init__(self, ib: IB, journal, learner,
                  commission: float = 10.0,
                  commission_rate: float = 0.0005,
-                 commission_min: float = 2.0):
+                 commission_min: float = 2.0,
+                 paper: bool = True,
+                 account_id: str = ""):
         self.ib = ib
         self.journal = journal
         self.learner = learner
         self._commission_rate = commission_rate
         self._commission_min  = commission_min
         self.commission = commission  # legacy fallback when trade value unknown
+        self.paper      = paper
+        self.account_id = account_id
         # Track which parent order IDs have already had their TP extended
         # (extension is applied at most once per position per session)
         self._tp_extended: set[int] = set()
+
+    @property
+    def _mode(self) -> str:
+        """Short label used in every log line so paper vs live is always visible."""
+        return "PAPER" if self.paper else "LIVE"
 
     # ── Exit sync ──────────────────────────────────────────────────────────
 
@@ -53,8 +62,8 @@ class PositionMonitor:
             return
 
         filled_orders = self._get_filled_exit_orders()
-        log.info("Monitoring %d open trades, %d filled exits found",
-                 len(open_trades), len(filled_orders))
+        log.info("[%s] Monitoring %d open trades, %d filled exits found",
+                 self._mode, len(open_trades), len(filled_orders))
 
         for trade in open_trades:
             order_id = trade.get("ibkr_order_id")
@@ -98,8 +107,8 @@ class PositionMonitor:
             )
 
             log.info(
-                "Exit recorded: %s  entry=%.4f  exit=%.4f  pnl_net=%.2f EUR",
-                trade.get("ticker"), entry_price, exit_price, pnl_net,
+                "[%s] Exit recorded: %s  entry=%.4f  exit=%.4f  pnl_net=%.2f EUR",
+                self._mode, trade.get("ticker"), entry_price, exit_price, pnl_net,
             )
 
     # ── Full account reconciliation ────────────────────────────────────────
@@ -151,21 +160,23 @@ class PositionMonitor:
             ccy      = getattr(pos.contract, "currency", "EUR")
             contract = Stock(sym, "SMART", ccy)
 
+            acct_label = f"acct={pos.account}"
+
             if qty < 0:
                 # Short position not in journal — always warn
                 log.warning(
-                    "[UNKNOWN SHORT] %s qty=%d avgCost=%.4f — NOT in journal. "
+                    "[%s|UNKNOWN SHORT] %s qty=%d avgCost=%.4f %s — NOT in journal. "
                     "allow_short=%s. Use manage_positions.py --shorts-only to cover.",
-                    sym, qty, pos.avgCost, allow_short,
+                    self._mode, sym, qty, pos.avgCost, acct_label, allow_short,
                 )
                 continue
 
             # Long position not in journal
             if sym in symbols_with_orders:
                 log.warning(
-                    "[UNKNOWN LONG] %s qty=%d avgCost=%.4f — NOT in journal "
+                    "[%s|UNKNOWN LONG] %s qty=%d avgCost=%.4f %s — NOT in journal "
                     "(has open orders, may be protected).",
-                    sym, qty, pos.avgCost,
+                    self._mode, sym, qty, pos.avgCost, acct_label,
                 )
             else:
                 # No orders at all — place a protective stop
@@ -178,15 +189,15 @@ class PositionMonitor:
                 try:
                     self.ib.placeOrder(contract, sl_order)
                     log.warning(
-                        "[UNKNOWN LONG] %s qty=%d avgCost=%.4f — NOT in journal. "
-                        "No orders found. Placed protective SL @ %.4f (%.1f%%).",
-                        sym, qty, pos.avgCost, sl_price, default_sl * 100,
+                        "[%s|UNKNOWN LONG] %s qty=%d avgCost=%.4f %s — NOT in journal, "
+                        "no orders. Placed protective SL @ %.4f (%.1f%%).",
+                        self._mode, sym, qty, pos.avgCost, acct_label,
+                        sl_price, default_sl * 100,
                     )
                 except Exception as e:
                     log.warning(
-                        "[UNKNOWN LONG] %s qty=%d — no journal entry, no orders, "
-                        "protective SL placement failed: %s",
-                        sym, qty, e,
+                        "[%s|UNKNOWN LONG] %s qty=%d %s — protective SL failed: %s",
+                        self._mode, sym, qty, acct_label, e,
                     )
 
     # ── Active position management ─────────────────────────────────────────
@@ -254,7 +265,8 @@ class PositionMonitor:
             and not getattr(t.order, "parentId", 0)
             and t.orderStatus.status not in ("Filled", "Cancelled", "Inactive")
         }
-        log.info("Active stop orders tracked: %d bracket + %d standalone  |  Open journal trades: %d",
+        log.info("[%s|%s] Active stops: %d bracket + %d standalone  |  Open journal trades: %d",
+                 self._mode, self.account_id or "?",
                  len(stop_trades), len(standalone_stops), len(open_trades))
 
         for rec in open_trades:
@@ -289,8 +301,9 @@ class PositionMonitor:
                 else (entry_px - current_px) / entry_px
             )
 
-            log.info("[MONITOR] %s  px=%.4f  entry=%.4f  P&L=%.2f%%  open=%.1fh",
-                     ticker, current_px, entry_px, unrealized_pct * 100, hours_open)
+            log.info("[%s|MONITOR] %s  px=%.4f  entry=%.4f  P&L=%.2f%%  open=%.1fh",
+                     self._mode, ticker, current_px, entry_px,
+                     unrealized_pct * 100, hours_open)
 
             horizon = rec.get("hold_horizon_days") or 1
             # TIF matches what the bracket was placed with
@@ -334,11 +347,13 @@ class PositionMonitor:
                         sl_order.account = account
                     try:
                         self.ib.placeOrder(contract, sl_order)
-                        log.warning("[SL-RESTORE] %s: re-placed missing SL @ %.4f "
+                        log.warning("[%s|SL-RESTORE] %s: re-placed missing SL @ %.4f "
                                     "(%.1f%% from %.4f)  tif=%s",
-                                    ticker, sl_price, sl_pct * 100, current_px, exit_tif)
+                                    self._mode, ticker, sl_price,
+                                    sl_pct * 100, current_px, exit_tif)
                     except Exception as e:
-                        log.warning("[SL-RESTORE] Failed to re-place SL for %s: %s", ticker, e)
+                        log.warning("[%s|SL-RESTORE] Failed for %s: %s",
+                                    self._mode, ticker, e)
 
             # ── Trailing stop ──────────────────────────────────────────────
             if unrealized_pct >= trail_trigger:
@@ -355,10 +370,12 @@ class PositionMonitor:
                         sl_trade.order.auxPrice = new_sl
                         try:
                             self.ib.placeOrder(contract, sl_trade.order)
-                            log.info("[TRAIL] %s  SL %.4f -> %.4f  (gain +%.2f%%)",
-                                     ticker, current_sl, new_sl, unrealized_pct * 100)
+                            log.info("[%s|TRAIL] %s  SL %.4f -> %.4f  (gain +%.2f%%)",
+                                     self._mode, ticker,
+                                     current_sl, new_sl, unrealized_pct * 100)
                         except Exception as e:
-                            log.warning("Trail SL modify failed for %s: %s", ticker, e)
+                            log.warning("[%s|TRAIL] SL modify failed for %s: %s",
+                                        self._mode, ticker, e)
                     else:
                         log.debug("[TRAIL] %s  SL already at max (%.4f)", ticker, current_sl)
                 else:
@@ -397,14 +414,14 @@ class PositionMonitor:
                             self.ib.placeOrder(contract, tp_trade.order)
                             self._tp_extended.add(parent_id)
                             log.info(
-                                "[TP-EXTEND] %s  progress=%.0f%%  TP %.4f -> %.4f  "
+                                "[%s|TP-EXTEND] %s  progress=%.0f%%  TP %.4f -> %.4f  "
                                 "(+%.1f%% from entry)  horizon=%dd",
-                                ticker, progress * 100, orig_tp, new_tp,
-                                abs(new_tp - entry_px) / entry_px * 100,
-                                horizon,
+                                self._mode, ticker, progress * 100, orig_tp, new_tp,
+                                abs(new_tp - entry_px) / entry_px * 100, horizon,
                             )
                         except Exception as e:
-                            log.warning("TP extension failed for %s: %s", ticker, e)
+                            log.warning("[%s|TP-EXTEND] Failed for %s: %s",
+                                        self._mode, ticker, e)
                     else:
                         log.debug("[TP-EXTEND] %s  no active TP order found", ticker)
 
@@ -413,8 +430,8 @@ class PositionMonitor:
             if (horizon == 1
                     and hours_open >= max_hold_h
                     and unrealized_pct < trail_trigger / 2):
-                log.info("[TIME EXIT] %s open %.1fh unrealized %.2f%% — closing flat",
-                         ticker, hours_open, unrealized_pct * 100)
+                log.info("[%s|TIME EXIT] %s open %.1fh unrealized %.2f%% — closing flat",
+                         self._mode, ticker, hours_open, unrealized_pct * 100)
                 self._force_exit(rec, contract, current_px, account)
 
     def _force_exit(self, rec: dict, contract: Stock, current_px: float, account: str = ""):
@@ -457,7 +474,7 @@ class PositionMonitor:
             if account:
                 order.account = account
             self.ib.placeOrder(contract, order)
-            log.info("[TIME EXIT] Market %s %d %s @ ~%.4f",
+            log.info("[%s|TIME EXIT] Market %s %d %s @ ~%.4f", self._mode,
                      exit_action, qty, contract.symbol, current_px)
 
         # Record ESTIMATED exit — marked pending_close so check_exits can
