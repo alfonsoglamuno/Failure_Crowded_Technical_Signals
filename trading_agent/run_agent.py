@@ -52,7 +52,9 @@ CET = ZoneInfo("Europe/Berlin")
 _MARKET_OPEN  = dtime(9, 10)
 _MARKET_CLOSE = dtime(17, 0)
 
-# GBP-denominated tickers — skip for EUR sizing (exchange rate not applied)
+# GBP-denominated tickers — kept in eurostoxx50_tickers.yaml for model data
+# but excluded from ibkr_contracts.yaml. Skip them early here to avoid a
+# misleading "no contract mapping" WARNING in the log.
 _GBP_TICKERS = {"CRH.L", "FLTR.L", "NG.L"}
 
 # Maximum fraction of universe tickers allowed to be stale/missing before
@@ -752,9 +754,9 @@ def run_once(paper: bool, cfg: dict):
                  len(open_ibkr_positions), max_open, slots_available)
 
         for sig in signals:
-            # Skip GBP-quoted stocks — position sizing assumes EUR
+            # Skip GBP-quoted stocks — no contract in ibkr_contracts.yaml, EUR only
             if sig.ticker in _GBP_TICKERS:
-                log.info("Skipping %s (GBP-denominated, EUR sizing not supported)", sig.ticker)
+                log.debug("Skipping %s (GBP-denominated, EUR-only policy)", sig.ticker)
                 continue
 
             # Hard guard: SELL entries are forbidden in long-only mode.

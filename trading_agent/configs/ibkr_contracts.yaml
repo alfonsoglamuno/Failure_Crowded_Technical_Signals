@@ -1,7 +1,13 @@
 # IBKR contract specifications for EURO STOXX 50 universe.
 # Yahoo ticker → IBKR (symbol, exchange, currency)
 # Exchange codes: XETRA (DE), AEB (NL), SBF (FR), BVME (IT), BM (ES),
-#                 EBR (BE), HEX (FI), LSE (GB)
+#                 EBR (BE), HEX (FI)
+#
+# EUR-only policy: only EUR-denominated contracts are listed here.
+# GBP-listed EUROSTOXX 50 members (CRH.L, FLTR.L, NG.L) are intentionally
+# excluded — the agent sizes positions in EUR and the EUR sizing does not
+# apply to GBP contracts. They remain in eurostoxx50_tickers.yaml so the
+# model continues to receive their price data as universe context.
 
 contracts:
   "ABI.BR":    {symbol: "ABI",    exchange: "EBR",   currency: "EUR"}
@@ -16,14 +22,12 @@ contracts:
   "BAYN.DE":   {symbol: "BAYN",   exchange: "XETRA", currency: "EUR"}
   "BMW.DE":    {symbol: "BMW",    exchange: "XETRA", currency: "EUR"}
   "BNP.PA":    {symbol: "BNP",    exchange: "SBF",   currency: "EUR"}
-  "CRH.L":     {symbol: "CRH",    exchange: "LSE",   currency: "GBP"}
   "DB1.DE":    {symbol: "DB1",    exchange: "XETRA", currency: "EUR"}
   "DHL.DE":    {symbol: "DHL",    exchange: "XETRA", currency: "EUR"}
   "DTE.DE":    {symbol: "DTE",    exchange: "XETRA", currency: "EUR"}
   "ENEL.MI":   {symbol: "ENEL",   exchange: "BVME",  currency: "EUR"}
   "ENI.MI":    {symbol: "ENI",    exchange: "BVME",  currency: "EUR"}
   "EL.PA":     {symbol: "EL",     exchange: "SBF",   currency: "EUR"}
-  "FLTR.L":    {symbol: "FLTR",   exchange: "LSE",   currency: "GBP"}
   "FME.DE":    {symbol: "FME",    exchange: "XETRA", currency: "EUR"}
   "HEI.DE":    {symbol: "HEI",    exchange: "XETRA", currency: "EUR"}
   "HEN3.DE":   {symbol: "HEN3",   exchange: "XETRA", currency: "EUR"}
@@ -37,7 +41,6 @@ contracts:
   "MBG.DE":    {symbol: "MBG",    exchange: "XETRA", currency: "EUR"}
   "MRK.DE":    {symbol: "MRK",    exchange: "XETRA", currency: "EUR"}
   "MUV2.DE":   {symbol: "MUV2",   exchange: "XETRA", currency: "EUR"}
-  "NG.L":      {symbol: "NG",     exchange: "LSE",   currency: "GBP"}
   # "NOKIA.HE": disabled — HEX/EUSTARS not executable on IBKR paper account (orders stay PreSubmitted)
   "OR.PA":     {symbol: "OR",     exchange: "SBF",   currency: "EUR"}
   "PHIA.AS":   {symbol: "PHIA",   exchange: "AEB",   currency: "EUR"}
@@ -46,9 +49,11 @@ contracts:
   "RWE.DE":    {symbol: "RWE",    exchange: "XETRA", currency: "EUR"}
   "SAF.PA":    {symbol: "SAF",    exchange: "SBF",   currency: "EUR"}
   "SAN.MC":    {symbol: "SAN",    exchange: "BM",    currency: "EUR"}
+  "SAN.PA":    {symbol: "SAN",    exchange: "SBF",   currency: "EUR"}
   "SAP.DE":    {symbol: "SAP",    exchange: "XETRA", currency: "EUR"}
   "SIE.DE":    {symbol: "SIE",    exchange: "XETRA", currency: "EUR"}
   "STLAM.MI":  {symbol: "STLAM",  exchange: "BVME",  currency: "EUR"}
+  "SU.PA":     {symbol: "SU",     exchange: "SBF",   currency: "EUR"}
   "TTE.PA":    {symbol: "TTE",    exchange: "SBF",   currency: "EUR"}
   "UCG.MI":    {symbol: "UCG",    exchange: "BVME",  currency: "EUR"}
   "VIV.PA":    {symbol: "VIV",    exchange: "SBF",   currency: "EUR"}

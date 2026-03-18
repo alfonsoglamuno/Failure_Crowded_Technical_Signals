@@ -1,5 +1,9 @@
 # EURO STOXX 50 constituents — Yahoo Finance tickers
 # As of early 2025; verify against official STOXX constituent list before use.
+#
+# GBP-denominated members (CRH.L, FLTR.L, NG.L) are kept here for model
+# training data but have NO entry in ibkr_contracts.yaml — they cannot be
+# traded under the EUR-only policy.
 tickers:
   - "ABI.BR"   # AB InBev
   - "ADYEN.AS" # Adyen
@@ -13,16 +17,16 @@ tickers:
   - "BAYN.DE"  # Bayer
   - "BMW.DE"   # BMW
   - "BNP.PA"   # BNP Paribas
-  - "CRH.L"    # CRH
+  - "CRH.L"    # CRH  [GBP — data only, not tradeable]
   - "DB1.DE"   # Deutsche Börse
   - "DHL.DE"   # DHL Group (Deutsche Post)
   - "DTE.DE"   # Deutsche Telekom
   - "ENEL.MI"  # Enel
   - "ENI.MI"   # Eni
   - "EL.PA"    # EssilorLuxottica
-  - "FLTR.L"   # Flutter Entertainment
+  - "FLTR.L"   # Flutter Entertainment  [GBP — data only, not tradeable]
   - "FME.DE"   # Fresenius Medical
-  - "HEI.DE"   # HeidelbergCement / Heidelberg Materials
+  - "HEI.DE"   # Heidelberg Materials
   - "HEN3.DE"  # Henkel
   - "IBE.MC"   # Iberdrola
   - "IFX.DE"   # Infineon
@@ -34,8 +38,8 @@ tickers:
   - "MBG.DE"   # Mercedes-Benz
   - "MRK.DE"   # Merck KGaA
   - "MUV2.DE"  # Munich Re
-  - "NG.L"     # National Grid
-  - "NOKIA.HE" # Nokia
+  - "NG.L"     # National Grid  [GBP — data only, not tradeable]
+  - "NOKIA.HE" # Nokia  [disabled in ibkr_contracts.yaml — HEX execution issues]
   - "OR.PA"    # L'Oréal
   - "PHIA.AS"  # Philips
   - "PRX.AS"   # Prosus
@@ -47,6 +51,7 @@ tickers:
   - "SAP.DE"   # SAP
   - "SIE.DE"   # Siemens
   - "STLAM.MI" # Stellantis
+  - "SU.PA"    # Schneider Electric
   - "TTE.PA"   # TotalEnergies
   - "UCG.MI"   # UniCredit
   - "VIV.PA"   # Vivendi
