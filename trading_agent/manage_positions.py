@@ -178,6 +178,7 @@ def run(
         feed.disconnect()
         return
 
+    from ib_insync import Stock as IBStock
     for p in to_close:
         qty    = int(abs(p.position))
         action = "BUY" if p.position < 0 else "SELL"
@@ -185,7 +186,10 @@ def run(
         order.account    = account
         order.tif        = "DAY"
         order.outsideRth = False
-        ib.placeOrder(p.contract, order)
+        # Portfolio contracts have exchange='' — must use SMART for order routing
+        ccy      = getattr(p.contract, "currency", "EUR")
+        contract = IBStock(p.contract.symbol, "SMART", ccy)
+        ib.placeOrder(contract, order)
         print(f"  Submitted: {action} {qty} {p.contract.symbol}")
 
     ib.sleep(3)

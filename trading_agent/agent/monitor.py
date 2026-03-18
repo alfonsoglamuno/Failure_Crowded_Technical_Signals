@@ -147,7 +147,7 @@ class PositionMonitor:
         #   standalone_stops    — restored standalone stops keyed by symbol
         #     (placed after original bracket expired; no parentId)
         self.ib.reqAllOpenOrders()
-        self.ib.sleep(1)
+        self.ib.sleep(2)  # 2s: IBKR pushes all open orders back via openOrder callbacks
         stop_trades = {
             t.order.parentId: t
             for t in self.ib.trades()
@@ -326,18 +326,36 @@ class PositionMonitor:
                 self._force_exit(rec, contract, current_px, account)
 
     def _force_exit(self, rec: dict, contract: Stock, current_px: float, account: str = ""):
-        """Cancel bracket children and exit with a market order."""
-        parent_id = rec.get("ibkr_order_id")
-        direction = rec.get("trade_direction", "BUY")
-        qty       = int(rec.get("quantity", 0))
+        """Cancel ALL pending orders for this position, then exit with a market order.
 
-        # Cancel TP and SL child orders first
+        Cancels both:
+          - bracket children (parentId == parent_id)  — same-session brackets
+          - standalone stops (parentId == 0, same symbol)  — restored cross-session SLs
+        Standalone SLs MUST be cancelled before the market exit; otherwise the SL
+        fires on an already-zero position and creates an accidental short.
+        """
+        parent_id  = rec.get("ibkr_order_id")
+        direction  = rec.get("trade_direction", "BUY")
+        qty        = int(rec.get("quantity", 0))
+        sym        = contract.symbol
+
         for t in self.ib.trades():
-            if getattr(t.order, "parentId", 0) == parent_id:
-                try:
-                    self.ib.cancelOrder(t.order)
-                except Exception:
-                    pass
+            order  = t.order
+            is_bracket_child  = getattr(order, "parentId", 0) == parent_id
+            is_standalone_sl  = (
+                getattr(order, "orderType", "") == "STP"
+                and not getattr(order, "parentId", 0)
+                and getattr(t.contract, "symbol", "") == sym
+            )
+            if is_bracket_child or is_standalone_sl:
+                if t.orderStatus.status not in ("Filled", "Cancelled", "Inactive"):
+                    try:
+                        self.ib.cancelOrder(order)
+                        log.info("[FORCE-EXIT] Cancelled %s order %d for %s",
+                                 "bracket-child" if is_bracket_child else "standalone-SL",
+                                 order.orderId, sym)
+                    except Exception:
+                        pass
         self.ib.sleep(1)
 
         if qty > 0:

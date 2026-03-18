@@ -1148,7 +1148,7 @@ def _eod_close(paper: bool, cfg: dict):
     """
     from agent.data_feed import IBKRFeed
     from agent.journal import Journal
-    from ib_insync import MarketOrder
+    from ib_insync import MarketOrder, Stock
     from dotenv import load_dotenv
     load_dotenv()
 
@@ -1224,11 +1224,15 @@ def _eod_close(paper: bool, cfg: dict):
                 skipped_multiday += 1
                 log.info("EOD: leaving multi-day long open: %s qty=%d", sym, qty)
                 continue
+            # Route via SMART — pos.contract.exchange is exchange-specific (IBIS,
+            # ENEXT.BE, etc.) which causes Error 321 "Missing order exchange".
+            ccy      = getattr(pos.contract, "currency", "EUR")
+            smart_ct = Stock(pos.contract.symbol, "SMART", ccy)
             if qty > 0:
                 order = MarketOrder("SELL", qty)
                 order.account = account
                 order.tif = "DAY"
-                ib.placeOrder(pos.contract, order)
+                ib.placeOrder(smart_ct, order)
                 log.info("EOD close LONG: SELL %d %s", qty, sym)
                 closed_long += 1
             else:
@@ -1236,7 +1240,7 @@ def _eod_close(paper: bool, cfg: dict):
                 order = MarketOrder("BUY", abs(qty))
                 order.account = account
                 order.tif = "DAY"
-                ib.placeOrder(pos.contract, order)
+                ib.placeOrder(smart_ct, order)
                 log.warning("EOD close SHORT: BUY %d %s (accidental short)", abs(qty), sym)
                 closed_short += 1
 
