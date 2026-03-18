@@ -221,7 +221,12 @@ def _variant_paths(model_dir: Path, variant: str) -> tuple[Path, Path]:
 
 
 def _apply_variant(cfg: dict, variant: str) -> None:
-    """Rewrite model paths in cfg based on variant name. Exits if not found."""
+    """Rewrite model paths in cfg based on variant name. Exits if not found.
+
+    Also auto-configures allow_short and follow_disabled from the variant suffix:
+      _longonly  → allow_short=False, follow_disabled=True  (fade long-only)
+      _both      → allow_short=True,  follow_disabled=False (fade+follow, both dirs)
+    """
     model_dir = Path(cfg["model"]["path"]).parent
     model_path, cols_path = _variant_paths(model_dir, variant)
     if not model_path.exists():
@@ -231,9 +236,23 @@ def _apply_variant(cfg: dict, variant: str) -> None:
             variant, model_path, variant,
         )
         sys.exit(1)
-    cfg["model"]["variant"]            = variant
-    cfg["model"]["path"]               = str(model_path)
-    cfg["model"]["feature_cols_path"]  = str(cols_path)
+    cfg["model"]["variant"]           = variant
+    cfg["model"]["path"]              = str(model_path)
+    cfg["model"]["feature_cols_path"] = str(cols_path)
+
+    # Auto-configure direction mode from variant suffix
+    if variant.endswith("_both"):
+        cfg["strategy"]["allow_short"]     = True
+        cfg["strategy"]["follow_disabled"] = False
+        log.info("Variant %s → allow_short=True  follow_disabled=False", variant)
+    elif variant.endswith("_longonly"):
+        cfg["strategy"]["allow_short"]     = False
+        cfg["strategy"]["follow_disabled"] = True
+        log.info("Variant %s → allow_short=False  follow_disabled=True", variant)
+    else:
+        log.warning("Unrecognised variant suffix in '%s' — "
+                    "allow_short/follow_disabled not changed", variant)
+
     log.info("Active model variant: %s", variant)
 
 
@@ -437,7 +456,7 @@ def run_once(paper: bool, cfg: dict):
     log.info("=" * 60)
     log.info("  MODE    : %s", mode_str)
     log.info("  ACCOUNT : %s", feed.account_id)
-    log.info("  VARIANT : %s  (allow_short=%s)", _active_variant,
+    log.info("  VARIANT : %s  (allow_short=%s)", cfg["model"].get("variant", "h3d_longonly"),
              cfg["strategy"].get("allow_short", False))
     log.info("=" * 60)
 
@@ -465,6 +484,8 @@ def run_once(paper: bool, cfg: dict):
         # ── Check exits from previous bracket orders ──────────────────────────
         monitor = PositionMonitor(feed.ib, journal, learner,
                                   commission=cfg["risk"]["commission_per_trade_eur"],
+                                  commission_rate=cfg["risk"].get("commission_rate_pct", 0.05) / 100,
+                                  commission_min=cfg["risk"].get("commission_min_eur", 2.0),
                                   paper=paper, account_id=feed.account_id)
         monitor.check_exits()
 
@@ -543,6 +564,11 @@ def run_once(paper: bool, cfg: dict):
                  probas.min(), probas.max(), probas.mean())
 
         # ── Strategy + risk filter ────────────────────────────────────────────
+        # Resolve active variant and horizon here so make_signals and the
+        # execution loop both use the same value.
+        _active_variant = cfg["model"].get("variant", "h3d_longonly")
+        _horizon_days   = _parse_horizon(_active_variant)
+
         # When follow_disabled=True, set follow_threshold to an impossible value
         # so make_signals never emits FOLLOW signals.  This is the canonical way
         # to honour the flag — P(failure) cannot be < 0, so no FOLLOW is emitted.
@@ -554,7 +580,7 @@ def run_once(paper: bool, cfg: dict):
             feature_df, probas,
             fade_threshold=learner.fade_threshold,
             follow_threshold=_follow_thr,
-            horizon_days=cfg["strategy"]["default_horizon"],
+            horizon_days=_horizon_days,
             crowding_min_score=cfg["strategy"].get("crowding_min_score", 0.30),
             regime_threshold_boost=cfg["strategy"].get("regime_threshold_boost", 0.05),
         )
@@ -680,11 +706,9 @@ def run_once(paper: bool, cfg: dict):
             and t.get("exit_price") is None
         }
 
-        # Horizon from active variant — drives correlation gate threshold.
-        _active_variant = cfg["model"].get("variant", "h3d_longonly")
-        _horizon_days   = _parse_horizon(_active_variant)
-        _corr_thr       = _corr_threshold(_horizon_days)
-        _allow_short    = cfg["strategy"].get("allow_short", False)
+        # Correlation gate threshold — horizon-scaled (set above near make_signals).
+        _corr_thr    = _corr_threshold(_horizon_days)
+        _allow_short = cfg["strategy"].get("allow_short", False)
 
         # Build set of tickers already active in IBKR:
         #   - any non-zero positions (long OR short — shorts block new long entries)
@@ -748,7 +772,7 @@ def run_once(paper: bool, cfg: dict):
 
             # Dedup — skip tickers already traded in an earlier scan today
             if sig.ticker in already_traded_today:
-                log.info("Skipping %s — already have an open trade from today's earlier scan", sig.ticker)
+                log.info("Skipping %s — already traded today (one trade per ticker per day)", sig.ticker)
                 continue
 
             # Don't add to an existing long position

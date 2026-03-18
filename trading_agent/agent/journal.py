@@ -115,6 +115,18 @@ class Journal:
                 (d, ticker, alert_name),
             ).fetchone()
             if existing:
+                # Never downgrade an actionable signal (FADE/FOLLOW) to SKIP.
+                # A second scan may not re-generate the signal (e.g. already
+                # traded today, or proba dropped below threshold), causing the
+                # loop to log SKIP for the same ticker+alert. That would corrupt
+                # the trade's action field via the signal JOIN and prevent
+                # the learner from recording the outcome correctly.
+                if action == "SKIP":
+                    cur_action = conn.execute(
+                        "SELECT action FROM signals WHERE id=?", (existing[0],)
+                    ).fetchone()
+                    if cur_action and cur_action[0] in ("FADE", "FOLLOW"):
+                        return existing[0]  # preserve actionable signal
                 conn.execute(
                     """UPDATE signals SET ts=?, failure_proba=?, action=?,
                        trade_direction=?, conviction=?, crowding_score=?,

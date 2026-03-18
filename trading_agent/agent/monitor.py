@@ -100,11 +100,22 @@ class PositionMonitor:
                 commission=commission,
             )
 
-            self.learner.record_outcome(
-                alert_name=trade.get("alert_name", "unknown"),
-                action=trade.get("action", "FADE"),
-                pnl_net=pnl_net,
-            )
+            action = trade.get("action", "FADE")
+            if action == "SKIP":
+                # Stale journal entry: trade was real but its signal got corrupted
+                # to SKIP on a second scan (journal.log_signal upsert race).
+                # The journal fix prevents this going forward; guard here as defence.
+                log.warning(
+                    "[%s] Exit for SKIP-action trade %s (id=%s) — "
+                    "journal signal was overwritten. Outcome NOT recorded to learner.",
+                    self._mode, trade.get("ticker"), trade.get("id"),
+                )
+            else:
+                self.learner.record_outcome(
+                    alert_name=trade.get("alert_name", "unknown"),
+                    action=action,
+                    pnl_net=pnl_net,
+                )
 
             log.info(
                 "[%s] Exit recorded: %s  entry=%.4f  exit=%.4f  pnl_net=%.2f EUR",

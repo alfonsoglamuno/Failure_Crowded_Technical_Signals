@@ -43,6 +43,7 @@ tickers:
   - "RWE.DE"   # RWE
   - "SAF.PA"   # Safran
   - "SAN.MC"   # Banco Santander
+  - "SAN.PA"   # Sanofi
   - "SAP.DE"   # SAP
   - "SIE.DE"   # Siemens
   - "STLAM.MI" # Stellantis
