@@ -97,20 +97,19 @@ model:
   #   horizon : 1d (intraday, default) | 3d (swing) | 5d (multi-day position)
   #   mode    : longonly (BUY entries only) | both (BUY + SELL direction scoring)
   #
-  # h1d_both is used here with allow_short=false:
-  #   - "both" scores ALL alert directions (bearish + bullish) → richer signal set
-  #   - allow_short=false means SELL entries are blocked at executor level
-  #   - Only BUY entries (FADE on bearish alerts) are placed
-  #   - With 7yr training data h1d_both is better calibrated than longonly:
-  #     AUC=0.605, P@0.60=67%, P@0.65=69% vs h1d_longonly which saturates
-  #     at P@0.50=75.3% with NO signals above 0.55 due to early XGBoost stopping.
+  # Default variant: h1d_longonly — intraday fades, BUY entries only, no shorting.
+  #   - allow_short=False enforced automatically by _apply_variant at startup
+  #   - To enable shorts, select h1d_both (or h3d_both / h5d_both) via --variant
+  #     or the interactive menu; shorts require confirmed IBKR locate availability.
   #
-  # Re-evaluate monthly: if allow_short is enabled, both mode is natural.
-  # If switching to swing trading use h3d_longonly or h3d_both.
-  variant: "h1d_both"
+  # Note on h1d_both vs h1d_longonly:
+  #   h1d_both scores both bearish and bullish alerts (richer signal set, AUC=0.605)
+  #   but allow_short=True is required to act on bearish signals. Use it only when
+  #   short locates are confirmed on the live account.
+  variant: "h1d_longonly"
   # Paths are derived from variant — change variant above, not paths below.
-  path: "data/model/xgboost_h1d_both.joblib"
-  feature_cols_path: "data/model/feature_cols_h1d_both.json"
+  path: "data/model/xgboost_h1d_longonly.joblib"
+  feature_cols_path: "data/model/feature_cols_h1d_longonly.json"
   min_history_days: 252
 
   # Learning loop — optimised for active paper trading (5 trades/day → fast feedback)
