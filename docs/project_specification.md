@@ -92,20 +92,26 @@ Panel augmented with all engineered columns from the 9 feature blocks (see §4).
 
 One row per (ticker, date, alert_name) triplet. Merges alert events with features and labels.
 
-| Column                | Type           | Description                                         |
-|-----------------------|----------------|-----------------------------------------------------|
-| date                  | datetime       | Alert date                                          |
-| ticker                | str            | Stock ticker                                        |
-| alert_name            | str            | Alert identifier (e.g. `rsi_overbought`)            |
-| direction             | str            | `bullish` / `bearish` / `neutral`                   |
-| n_simultaneous_alerts | int            | Count of alerts on same (date, ticker)              |
-| fwd_ret_1d            | float64        | Forward 1-day return, close(t) to close(t+1)        |
-| fwd_ret_3d            | float64        | Forward 3-day return                                |
-| fwd_ret_5d            | float64        | Forward 5-day return                                |
-| label_failure_1d      | float {0,1}    | 1 = alert failed at 1-day horizon                   |
-| label_failure_3d      | float {0,1}    | 1 = alert failed at 3-day horizon                   |
-| label_failure_5d      | float {0,1}    | 1 = alert failed at 5-day horizon                   |
-| [feature columns]     | float64        | All 80+ features from the 9 blocks below            |
+| Column                       | Type           | Description                                         |
+|------------------------------|----------------|-----------------------------------------------------|
+| date                         | datetime       | Alert date                                          |
+| ticker                       | str            | Stock ticker                                        |
+| alert_name                   | str            | Alert identifier (e.g. `rsi_overbought`)            |
+| direction                    | str            | `bullish` / `bearish` / `neutral`                   |
+| n_simultaneous_alerts        | int            | Count of alerts on same (date, ticker)              |
+| fwd_ret_1d                   | float64        | Forward 1-day return, close(t) to close(t+1)        |
+| fwd_ret_3d                   | float64        | Forward 3-day return                                |
+| fwd_ret_5d                   | float64        | Forward 5-day return                                |
+| fwd_ret_10d                  | float64        | Forward 10-day return                               |
+| label_profitable_1d          | float {0,1}    | 1 = BUY trade profitable at 1-day horizon           |
+| label_profitable_3d          | float {0,1}    | 1 = BUY trade profitable at 3-day horizon           |
+| label_profitable_5d          | float {0,1}    | 1 = BUY trade profitable at 5-day horizon           |
+| label_profitable_10d         | float {0,1}    | 1 = BUY trade profitable at 10-day horizon          |
+| label_profitable_fade_1d     | float {0,1}    | 1 = FADE trade profitable at 1-day horizon (both)   |
+| label_profitable_fade_3d     | float {0,1}    | 1 = FADE trade profitable at 3-day horizon (both)   |
+| label_profitable_fade_5d     | float {0,1}    | 1 = FADE trade profitable at 5-day horizon (both)   |
+| label_profitable_fade_10d    | float {0,1}    | 1 = FADE trade profitable at 10-day horizon (both)  |
+| [feature columns]            | float64        | All 80+ features from the 9 blocks below            |
 
 ---
 
@@ -117,19 +123,27 @@ One row per (ticker, date, alert_name) triplet. Merges alert events with feature
 fwd_ret_h(t) = close(t + h) / close(t) - 1
 ```
 
-### Binary Failure Label
+### Binary Profitable Label (always-profit mode)
 
-For an alert on day `t` with horizon `h` and threshold `θ = 0.005` (0.5%):
+All models predict **P(trade is profitable)**. For an alert on day `t` with horizon `h` and threshold `θ = 0.002` (0.2% after commission):
 
-| Alert direction | Label = 1 (failure)       | Label = 0 (continuation) |
-|-----------------|---------------------------|--------------------------|
-| bullish         | `fwd_ret_h < −θ`          | `fwd_ret_h >= −θ`        |
-| bearish         | `fwd_ret_h > +θ`          | `fwd_ret_h <= +θ`        |
-| neutral         | `|fwd_ret_h| > θ`         | `|fwd_ret_h| <= θ`       |
+**Longonly mode** (all entries BUY):
 
-**Why 0.5%?** Captures economically meaningful reversals after commission (0.10% round-trip), while filtering pure noise moves.
+| Alert direction | long_return              | Label = 1 (profitable)     |
+|-----------------|--------------------------|----------------------------|
+| bullish (FOLLOW)| `fwd_ret_h`              | `long_return > θ`          |
+| bearish (FADE)  | `-fwd_ret_h`             | `long_return > θ`          |
 
-**Base rate**: ~37-47% failure rate depending on horizon. The model does not need a 50%+ base rate — it only needs to identify a subset where failure probability is meaningfully above base rate.
+**Both mode** (FADE entries, BUY + SELL):
+
+| Alert direction | Trade type    | Label = 1 (profitable)      |
+|-----------------|---------------|-----------------------------|
+| bullish         | FADE → SELL   | `fwd_ret_h < −θ`            |
+| bearish         | FADE → BUY    | `fwd_ret_h > +θ`            |
+
+**Why 0.2%?** Minimum economically meaningful move after 0.10% round-trip commission.
+
+**Horizons**: h ∈ {1, 3, 5, 10} days. Eight variants cover all horizon × mode combinations.
 
 ---
 
@@ -233,23 +247,25 @@ Direction and rate-of-change of momentum, not just levels. A bearish alert into 
 
 ## 5. Model Variants
 
-Six models covering all combinations of hold horizon × direction mode.
+Eight models covering all combinations of hold horizon × direction mode. All predict **P(trade is profitable)**.
 
-| Variant          | Horizon | Mode      | Correlation Gate | Training set          |
-|------------------|---------|-----------|------------------|-----------------------|
-| `h1d_longonly`   | 1 day   | Long-only | 0.85             | Bearish/neutral alerts only |
-| `h3d_longonly`   | 3 days  | Long-only | 0.70             | Bearish/neutral alerts only |
-| `h5d_longonly`   | 5 days  | Long-only | 0.65             | Bearish/neutral alerts only |
-| `h1d_both`       | 1 day   | Long+Short | 0.85 (dir-adj)  | All alert directions  |
-| `h3d_both`       | 3 days  | Long+Short | 0.70 (dir-adj)  | All alert directions  |
-| `h5d_both`       | 5 days  | Long+Short | 0.65 (dir-adj)  | All alert directions  |
+| Variant          | Horizon  | Mode       | Correlation Gate | Label column                    |
+|------------------|----------|------------|------------------|---------------------------------|
+| `h1d_longonly`   | 1 day    | Long-only  | 0.85             | `label_profitable_1d`           |
+| `h3d_longonly`   | 3 days   | Long-only  | 0.70             | `label_profitable_3d`           |
+| `h5d_longonly`   | 5 days   | Long-only  | 0.65             | `label_profitable_5d`           |
+| **`h10d_longonly`** | **10 days** | **Long-only** | **0.60** | **`label_profitable_10d`** |
+| `h1d_both`       | 1 day    | Long+Short | 0.85 (dir-adj)   | `label_profitable_fade_1d`      |
+| `h3d_both`       | 3 days   | Long+Short | 0.70 (dir-adj)   | `label_profitable_fade_3d`      |
+| `h5d_both`       | 5 days   | Long+Short | 0.65 (dir-adj)   | `label_profitable_fade_5d`      |
+| `h10d_both`      | 10 days  | Long+Short | 0.60 (dir-adj)   | `label_profitable_fade_10d`     |
 
-**Default: `h1d_longonly`** — intraday holds, EOD close at 16:30 CET, no short-selling risk.
+**Recommended default: `h10d_longonly`** — optimizer-selected based on best risk-adjusted backtest performance (Sharpe 0.89 on gap_up alert family).
 
 ### Longonly vs Both
 
-- **`longonly`**: trained only on bearish/neutral events. Training examples exactly match the FADE→BUY trades that will be taken. Better calibrated for a long-only book.
-- **`both`**: trained on all directions. Required when `allow_short=true` because the model must also score bullish-alert failure (FADE→SELL). More data, but noisier for pure long-only decisions.
+- **`longonly`**: trains on all directional alerts (bullish + bearish). All entries are BUY. Bullish → FOLLOW, bearish → FADE contrarian BUY. Better calibrated for a long-only book.
+- **`both`**: trains on all directions, BUY + SELL entries. Model predicts P(FADE is profitable). Required when `allow_short=true`. More data, but noisier for pure long-only decisions.
 
 ### Correlation Gate
 
@@ -310,14 +326,17 @@ assign_labels(events, features, horizons=[1,3,5], theta=0.005)
 ### Step 5: Model Training (XGBoost, per variant)
 ```
 For each variant (horizon, mode):
-    Filter events by mode (longonly → bearish/neutral only)
+    Filter events by direction (bullish + bearish for both modes)
     X = feature_cols (no forward-looking columns)
-    y = label_failure_{horizon}d
+    y = label_profitable_{horizon}d  (longonly)
+      | label_profitable_fade_{horizon}d  (both)
     Compute exponential sample weights (252-day half-life)
     Chronological train/validation split
     model.fit(X_train, y_train, sample_weight=w_train)
     Save model + feature_cols to data/model/
 ```
+
+All models predict P(trade is profitable) — always-profit mode.
 
 Trained via `trading_agent/bootstrap_model.py --yfinance`.
 
@@ -362,7 +381,7 @@ python reports/evaluate_models.py
 ## 10. Adaptive Learning
 
 ### Fast loop (every 10 completed trades)
-Recalibrates `fade_threshold` based on recent win/loss rate:
+Recalibrates `profit_threshold` based on recent win/loss rate:
 - Win rate < 50% → raise threshold (more selective)
 - Win rate > 65% → lower threshold (capture more signals)
 
@@ -396,12 +415,11 @@ The `atr_vs_commission` feature (ATR / 0.10%) explicitly models tradability. The
 
 | Parameter                    | Value  | Notes                                               |
 |------------------------------|--------|-----------------------------------------------------|
-| `theta` (label threshold)    | 0.5%   | Minimum economically meaningful reversal            |
-| `horizons`                   | 1,3,5  | Days; 6 variants cover all combinations            |
-| `fade_threshold`             | 0.60   | Default — recalibrated by adaptive learner          |
-| `follow_threshold`           | 0.40   | Below this → FOLLOW (disabled by default)           |
-| `stop_loss_pct`              | 1.5%   | ~1 STOXX50 daily ATR                               |
-| `take_profit_pct`            | 2.5%   | ~1.7:1 reward/risk ratio                           |
+| `theta` (label threshold)    | 0.2%   | Minimum profitable move after commission            |
+| `horizons`                   | 1,3,5,10 | Days; 8 variants cover all combinations          |
+| `profit_threshold`           | 0.55   | Default — recalibrated by adaptive learner          |
+| `stop_loss_pct`              | 1.5-5% | Varies by horizon (h1d=1.5%, h10d=5%)             |
+| `take_profit_pct`            | 2.5-8% | Varies by horizon (h1d=2.5%, h10d=8%)             |
 | `max_position_pct`           | 2%     | ~2,000 EUR per trade on 100K capital               |
 | `max_open_positions`         | 10     | Slot cap                                            |
 | `max_daily_loss_eur`         | 300    | 0.3% of capital — stops trading for the day        |

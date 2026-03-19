@@ -38,9 +38,12 @@ class AdaptiveLearner:
         mcfg = cfg["model"]
         scfg = cfg["strategy"]
 
-        self.fade_threshold   = scfg["fade_threshold"]
-        self.follow_threshold = scfg["follow_threshold"]
-        self.follow_disabled  = scfg.get("follow_disabled", True)
+        # Fade/follow thresholds — P(failure) decision boundaries.
+        # fade_threshold   : P(fail) >= this → FADE (go against signal)
+        # follow_threshold : P(fail) <= this → FOLLOW (go with signal)
+        # Accept profit_threshold as a legacy alias for fade_threshold.
+        self.fade_threshold   = scfg.get("fade_threshold", scfg.get("profit_threshold", 0.60))
+        self.follow_threshold = scfg.get("follow_threshold", 1.0 - self.fade_threshold)
 
         self._min_trades           = mcfg["min_trades_for_recalibration"]
         self._retrain_days         = mcfg.get("retrain_frequency_days", 30)
@@ -69,13 +72,13 @@ class AdaptiveLearner:
             try:
                 with open(self._state_path) as f:
                     state = json.load(f)
-                self.fade_threshold   = state.get("fade_threshold",   self.fade_threshold)
-                self.follow_threshold = state.get("follow_threshold", self.follow_threshold)
+                self.fade_threshold   = state.get("fade_threshold", self.fade_threshold)
+                self.follow_threshold = state.get("follow_threshold", 1.0 - self.fade_threshold)
                 self._alert_stats     = defaultdict(
                     lambda: {"wins": 0, "total": 0},
                     state.get("alert_stats", {}),
                 )
-                log.info("Learner state loaded: fade=%.3f  follow=%.3f",
+                log.info("Learner state loaded: fade_threshold=%.3f  follow_threshold=%.3f",
                          self.fade_threshold, self.follow_threshold)
             except Exception as e:
                 log.warning("Could not load learner state: %s", e)
@@ -100,11 +103,7 @@ class AdaptiveLearner:
         Gate:
           - Requires at least min_trades_for_recalibration samples before blocking.
           - Blocks when win rate < suppress_win_rate_threshold (default 0.25).
-          - Only applies to action types that are currently enabled
-            (FADE always eligible; FOLLOW only when not follow_disabled).
         """
-        if action == "FOLLOW" and self.follow_disabled:
-            return False  # already disabled globally — no need for per-alert check
         min_n     = self._min_trades
         threshold = self.cfg["model"].get("suppress_win_rate_threshold", 0.25)
         key       = f"{action}:{alert_name}"
@@ -161,29 +160,12 @@ class AdaptiveLearner:
                 self.fade_threshold = round(max(old - self._step_down, 0.55), 3)
 
             if self.fade_threshold != old:
-                log.info("FADE threshold: %.3f → %.3f  (win_rate=%.1f%%  n=%d)",
-                         old, self.fade_threshold, win_rate * 100, len(fade_trades))
+                self.follow_threshold = round(1.0 - self.fade_threshold, 4)
+                log.info("FADE threshold: %.3f → %.3f  follow_threshold → %.3f  (win_rate=%.1f%%  n=%d)",
+                         old, self.fade_threshold, self.follow_threshold, win_rate * 100, len(fade_trades))
                 changed = True
 
             self._log_alert_breakdown(fade_trades, "FADE")
-
-        # ── Follow threshold ──────────────────────────────────────────────
-        if not self.follow_disabled:
-            follow_trades = [t for t in completed if t.get("action") == "FOLLOW"]
-            if len(follow_trades) >= self._min_trades:
-                wins = sum(1 for t in follow_trades if (t.get("pnl_net") or 0) > 0)
-                win_rate = wins / len(follow_trades)
-                old = self.follow_threshold
-
-                if win_rate < self._win_target - 0.05:
-                    self.follow_threshold = round(max(old - self._step_up, 0.10), 3)
-                elif win_rate > self._win_target + 0.10:
-                    self.follow_threshold = round(min(old + self._step_down, 0.45), 3)
-
-                if self.follow_threshold != old:
-                    log.info("FOLLOW threshold: %.3f → %.3f  (win_rate=%.1f%%)",
-                             old, self.follow_threshold, win_rate * 100)
-                    changed = True
 
         if changed:
             self._save_state()

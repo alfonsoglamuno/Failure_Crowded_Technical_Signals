@@ -2,11 +2,20 @@
 
 ## Core Question
 
-> Given a visible chart alert (breakout, RSI extreme, MACD cross, abnormal volume) on a EURO STOXX 50 stock — and the surrounding market context — what is the probability that this alert will **fail to follow through** over the next 1-5 sessions?
+> Given a visible chart alert (breakout, RSI extreme, MACD cross, abnormal volume) on a EURO STOXX 50 stock — and the surrounding market context — what is the probability that a trade on this alert will be **profitable** over the next 1-10 sessions?
 
-The model does not predict price direction. It predicts **signal reliability conditioned on context**. A bearish signal that fires into a high-correlation, high-momentum, high-volume environment has very different failure odds than the same signal in an idiosyncratic, low-crowding environment.
+The model does not predict price direction. It predicts **P(trade is profitable) conditioned on context**. A bearish signal that fires into a high-correlation, high-momentum, high-volume environment has very different profit odds than the same signal in an idiosyncratic, low-crowding environment.
 
-**Tradeable consequence**: when the model assigns high probability of failure to a bearish alert, we enter a contrarian long (FADE → BUY). When a bullish alert is predicted to fail, we enter a contrarian short (FADE → SELL, requires `allow_short=true`).
+**Tradeable consequence**: when the model assigns high probability of profit to a bearish alert, we enter a contrarian long (FADE → BUY). When a bullish alert scores high, we enter momentum (FOLLOW → BUY). Short entries require `allow_short=true` with a `_both` variant.
+
+---
+
+## Model Architecture
+
+- **All models predict P(trade is profitable)** — never P(failure). This is always-profit mode.
+- **8 variants**: h1d / h3d / h5d / h10d × longonly / both
+- **Recommended default**: `h10d_longonly` — 10-day hold, long-only, gap_up alert family, Sharpe 0.89 on optimizer backtest
+- **Optimizer output**: running `python optimize_strategy.py --yfinance` produces `strategy_recommendation.yaml` which auto-configures the agent for the best-performing alert+variant combination
 
 ---
 
@@ -56,14 +65,16 @@ Each alert fires with a direction (bullish / bearish / neutral). The model learn
 
 ## Label Design
 
-For each alert event on day `t`:
+For each alert event on day `t`, the label is **P(trade is profitable)**:
 
-- **Bearish alert failure**: forward return over `[t+1, t+h]` > +θ (expected move did not happen — price went up)
-- **Bullish alert failure**: forward return over `[t+1, t+h]` < −θ (expected continuation did not happen)
+- **Longonly mode** (all entries BUY): `label = 1` if `long_return > 0.2%` after commission
+  - Bullish alert: `long_return = fwd_ret_{h}d` (FOLLOW momentum)
+  - Bearish alert: `long_return = -fwd_ret_{h}d` (FADE contrarian BUY)
+- **Both mode** (FADE entries, BUY + SELL): `label = 1` if FADE trade is profitable
+  - Bullish alert FADE (SHORT): `label = 1` if `fwd_ret_{h}d < -0.2%`
+  - Bearish alert FADE (BUY): `label = 1` if `fwd_ret_{h}d > +0.2%`
 
-Where `h ∈ {1, 3, 5}` days and `θ = 0.5%` (minimum economically meaningful move after costs).
-
-Six model variants cover all horizon x direction combinations (see below).
+Where `h ∈ {1, 3, 5, 10}` days. Eight model variants cover all horizon × direction combinations (see below).
 
 ---
 
@@ -125,22 +136,24 @@ All features use only data available at the close of day T. Forward-looking colu
 
 ## Model Variants
 
-Six models across two axes:
+Eight models across two axes: horizon (1d / 3d / 5d / 10d) × direction mode (longonly / both).
 
 | Variant | Horizon | Direction | Primary use case |
 |---------|---------|-----------|-----------------|
-| **`h1d_longonly`** | 1 day | Long-only | **Default** — intraday fades, EOD close, no shorts |
+| **`h10d_longonly`** | 10 days | Long-only | **Recommended default** — optimizer top pick (gap_up, Sharpe 0.89) |
+| `h1d_longonly` | 1 day | Long-only | Intraday fades, EOD close, no shorts |
 | `h3d_longonly` | 3 days | Long-only | Swing fades, 3-day holds, no shorts |
 | `h5d_longonly` | 5 days | Long-only | Multi-day positions, no shorts |
 | `h1d_both` | 1 day | Long + Short | Intraday, requires `allow_short=true` |
 | `h3d_both` | 3 days | Long + Short | Swing, requires `allow_short=true` |
 | `h5d_both` | 5 days | Long + Short | Position, requires `allow_short=true` |
+| `h10d_both` | 10 days | Long + Short | Multi-week, requires `allow_short=true` |
 
-**`longonly`**: trains only on bearish/neutral alert events — optimised for FADE→BUY entries. Better calibrated for a long-only book because training examples exactly match the trades executed.
+**`longonly`**: trains on all directional alerts (bullish + bearish). All entries are BUY. Bullish alerts → FOLLOW (momentum), bearish alerts → FADE (contrarian BUY). Better calibrated for a long-only book.
 
-**`both`**: trains on all alert directions. Required when `allow_short=true` because the model must also score bullish-alert failure (FADE→SELL). Has more training data but is noisier for long-only decisions.
+**`both`**: trains on all alert directions, BUY + SELL entries. Model predicts P(FADE is profitable). Required when `allow_short=true`. Has more training data but noisier for pure long-only decisions.
 
-**Default is `h1d_longonly`** — intraday holds, EOD close, no short-selling risk. This is the safest starting point and the model most aligned to what is actually traded.
+**Recommended default is `h10d_longonly`** — optimizer-selected based on best risk-adjusted returns. Set via `model.variant` in `configs/config.yaml` or auto-configured by `optimize_strategy.py`.
 
 ### Correlation treatment by mode
 

@@ -7,12 +7,12 @@ Computes a human-readable rationale for every signal, grounded in:
     volume surges, extreme price positions, and news events attract retail
     crowding that sophisticated participants can fade.
 
-  • Lopez de Prado (2018) — meta-labeling: a second signal (crowding intensity)
-    should confirm the primary model prediction before we bet on it.
+  • Lopez de Prado (2018) — meta-labeling: model prediction (P(alert failure))
+    drives the primary trade decision.
 
 Public API
 ----------
-    compute_crowding_score(row)        → float  0-1
+    compute_crowding_score(row)              → float  0-1 composite crowding score
     build_explanation(model, row, ...) → str    human-readable narrative
 """
 
@@ -51,70 +51,60 @@ _FEAT_LABELS: dict[str, str] = {
 }
 
 
-# ── Crowding score ─────────────────────────────────────────────────────────────
+# ── Crowding score (Barber & Odean, 2008) ─────────────────────────────────────
 
 def compute_crowding_score(row: pd.Series) -> float:
     """
-    Returns a crowding / attention score in [0, 1].
+    Composite attention/crowding score (Barber & Odean, 2008).
 
-    Components (Barber & Odean, 2008):
-      • Volume anomaly      — retail attention proxy (0-0.40)
-      • Simultaneous alerts — multiple crowd signals (0-0.30)
-      • Price at 20d extreme — price attention zone (0-0.20)
-      • Compressed volatility — ATR exhaustion → reversal likely (0-0.10)
+    Score = weighted sum of four attention indicators:
+      1. vol_zscore_20d  : volume z-score vs 20-day mean (surge = crowd buying)
+      2. price_pos_20d   : price position in 20-day range (extreme = crowd attention)
+      3. atr_norm_14     : normalised ATR (volatility surge = crowd panic/excitement)
+      4. n_simultaneous_alerts : concurrent alerts on same ticker (pile-on)
 
-    A score ≥ 0.30 means at least one strong attention indicator is present.
-
-    Feature name mapping (pipeline produces these names):
-      vol_zscore_20d    — z-score of volume vs 20d mean (high = abnormal volume)
-      n_simultaneous_alerts — count of alerts firing same day for this ticker
-      price_pos_20d     — price position within 20d range [0=low, 1=high]
-      atr_norm_14       — ATR normalised by close price (14-period)
+    Returns value in [0, 1]. Higher = more crowded/attentive market.
     """
     score = 0.0
 
-    # ── Volume component ──────────────────────────────────────────────────────
-    # vol_zscore_20d: z-score of today's volume vs 20d average.
-    # z >= 2 ≈ ratio >= 1.5x  (2 standard deviations above mean)
-    vol_z = _safe_float(row, "vol_zscore_20d", default=-99.0)
-    if vol_z > -99.0:   # feature is present
+    # 1. Volume surge — z-score of today's volume vs 20-day mean
+    vol_z = float(row.get("vol_zscore_20d", -1))
+    if vol_z >= 0:  # sentinel -1 = missing
         if vol_z >= 3.0:
-            score += 0.40   # extreme volume spike (≈ ratio >= 2.5x)
+            score += 0.40
         elif vol_z >= 2.0:
-            score += 0.30   # strong volume anomaly (≈ ratio >= 2x)
+            score += 0.30
         elif vol_z >= 1.5:
-            score += 0.20   # notable volume above norm
+            score += 0.20
         elif vol_z >= 1.0:
             score += 0.10
 
-    # ── Concurrent alerts component ───────────────────────────────────────────
-    n_alerts = int(_safe_float(row, "n_simultaneous_alerts", default=1.0))
-    if n_alerts >= 3:
-        score += 0.30
-    elif n_alerts >= 2:
-        score += 0.15
-
-    # ── Price position at 20d extreme component ───────────────────────────────
-    # price_pos_20d: 0 = at 20d low, 1 = at 20d high.
-    # Extremes indicate crowd attention (people notice new highs/lows).
-    pos = _safe_float(row, "price_pos_20d", default=-1.0)
-    if pos >= 0:    # feature present (default -1 when absent → skipped)
-        if pos >= 0.90 or pos <= 0.10:
-            score += 0.20
+    # 2. Price position in 20-day range (0 = 20d low, 1 = 20d high)
+    pos = float(row.get("price_pos_20d", -1))
+    if pos >= 0:  # sentinel -1 = missing
+        if pos >= 0.90 or pos <= 0.10:   # extreme = crowd attention
+            score += 0.30
         elif pos >= 0.80 or pos <= 0.20:
+            score += 0.20
+        elif pos >= 0.70 or pos <= 0.30:
             score += 0.10
 
-    # ── Compressed volatility component ───────────────────────────────────────
-    # atr_norm_14: ATR / close price over 14 periods.
-    # Low ATR (< 1%) → coiled volatility, crowd building position.
-    atr = _safe_float(row, "atr_norm_14", default=-1.0)
-    if atr >= 0:    # feature present
-        if atr < 0.010:
+    # 3. Volatility surge (normalised ATR-14)
+    atr = float(row.get("atr_norm_14", -1))
+    if atr >= 0:  # sentinel -1 = missing
+        if atr >= 0.04:    # >4% daily ATR = panic/excitement
+            score += 0.20
+        elif atr >= 0.025:
             score += 0.10
-        elif atr < 0.015:
-            score += 0.05
 
-    return round(min(score, 1.0), 3)
+    # 4. Concurrent alerts on same ticker (pile-on)
+    n_alerts = int(row.get("n_simultaneous_alerts", 0))
+    if n_alerts >= 3:
+        score += 0.10
+    elif n_alerts >= 2:
+        score += 0.05
+
+    return min(score, 1.0)
 
 
 # ── SHAP explanation ───────────────────────────────────────────────────────────
@@ -128,22 +118,23 @@ def build_explanation(
     alert_direction: str,
     action: str,
     trade_direction: str,
-    crowding_score: float,
     top_n: int = 3,
 ) -> str:
     """
     Returns a one-line human-readable explanation of the trade rationale.
 
+    failure_proba : P(alert fails to follow through) — from the model.
+
     Attempts SHAP TreeExplainer for feature attribution; falls back to
     model.feature_importances_ if shap is unavailable.
     """
-    crowding_narrative = _crowding_narrative(feature_row, crowding_score)
+    crowding_narrative = _crowding_narrative(feature_row)
     regime_narrative   = _regime_narrative(feature_row)
     drivers            = _driver_narrative(model, feature_row, feature_cols, top_n)
 
     return (
         f"{action} {trade_direction} | {alert_direction} '{alert_name}' | "
-        f"P(fail)={failure_proba:.2f} crowd={crowding_score:.2f} | "
+        f"P(fail)={failure_proba:.2f} | "
         f"{crowding_narrative} | {regime_narrative} | "
         f"drivers: [{drivers}]"
     )
@@ -158,7 +149,7 @@ def _driver_narrative(model, row: pd.Series, feature_cols: list[str], top_n: int
         sv = explainer.shap_values(X)
         # shap_values returns (1, n_features) for XGBoost binary
         if isinstance(sv, list):
-            vals = sv[1][0]          # class-1 (failure)
+            vals = sv[1][0]          # class-1 (profitable)
         elif hasattr(sv, "values"):  # newer shap returns Explanation object
             v = sv.values
             vals = v[0] if v.ndim == 2 else v[0, :, 1]
@@ -194,7 +185,7 @@ def _driver_narrative(model, row: pd.Series, feature_cols: list[str], top_n: int
     return ", ".join(parts)
 
 
-def _crowding_narrative(row: pd.Series, score: float) -> str:
+def _crowding_narrative(row: pd.Series) -> str:
     """Short attention condition description."""
     parts = []
 
@@ -215,7 +206,7 @@ def _crowding_narrative(row: pd.Series, score: float) -> str:
         parts.append("near 52w low (oversold)")
 
     if not parts:
-        return f"standard conditions (crowd={score:.2f})"
+        return "standard conditions"
     return "; ".join(parts)
 
 

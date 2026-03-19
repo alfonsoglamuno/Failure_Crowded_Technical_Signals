@@ -142,7 +142,8 @@ def get_trades(db: str, start: date, end: date) -> list[dict]:
     with _conn(db) as conn:
         rows = conn.execute("""
             SELECT t.*, s.action, s.alert_name, s.alert_direction,
-                   s.failure_proba, s.crowding_score, s.conviction
+                   COALESCE(s.profit_proba, 0.0) AS failure_proba,
+                   s.conviction
             FROM trades t
             LEFT JOIN signals s ON t.signal_id = s.id
             WHERE t.exit_price IS NOT NULL

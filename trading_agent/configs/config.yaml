@@ -64,9 +64,24 @@ risk:
     trail_step_pct: 0.010        # 1.0% step
     max_hold_hours: 9999         # no hourly exit
 
+  # h10d (swing/trend, 10-day hold): 10-day ATR ~8-10%.
+  #   OOS results: gap_up FOLLOW 58.6% win, Sharpe 0.89; MA cross 56.1% win, Sharpe 0.88
+  #   SL=5.0%, TP=8.0% → reward/risk 1.60:1 (wider — ride 10-day trend moves)
+  h10d:
+    stop_loss_pct: 0.050
+    take_profit_pct: 0.080
+    trail_trigger_pct: 0.030     # 3.0% before trailing (let it run)
+    trail_step_pct: 0.015        # 1.5% step
+    max_hold_hours: 9999         # 10-day time exit managed by hold_horizon_days
+
 strategy:
-  fade_threshold: 0.60      # P(failure) >= 0.60 → FADE  (lowered from 0.65 — more signals)
-  follow_threshold: 0.40    # P(failure) <= 0.40 → FOLLOW (raised from 0.35 — symmetric)
+  # Core thesis (Barber & Odean 2008): model predicts P(alert failure).
+  # High P(failure) + crowding present → FADE (go against signal direction).
+  # Low P(failure) → FOLLOW (go with signal direction).
+  fade_threshold: 0.60      # P(fail) >= 0.60 → FADE (crowding gate also required)
+  follow_threshold: 0.40    # P(fail) <= 0.40 → FOLLOW (no crowding gate)
+  crowding_min_score: 0.30  # minimum crowding score to FADE (Barber & Odean gate)
+  regime_threshold_boost: 0.05  # raise fade_threshold when market trends with alert
   default_horizon: 1        # 1-day hold, intraday focus
   allow_short: false        # SHORT DISABLED — IBKR paper borrow not available for European stocks.
                             # Re-enable once IBKR confirms short locates are working on live account.
@@ -81,71 +96,60 @@ strategy:
                             # cycle runs before forced flatten.
   max_open_positions: 10    # max simultaneous open long positions
 
-  # Start with FADE only — we have more data on it. Enable FOLLOW after 50 FADE trades.
-  follow_disabled: true
+  # Alert whitelist — restrict signal generation to these alert types only.
+  # Empty list (or omit) = all alerts considered.
+  # Populated from optimizer results (python optimize_strategy.py --yfinance):
+  #   gap_up + follow_bullish + h10d: Sharpe 0.891, 58.6% win, 2556 OOS trades
+  #   ma_cross_bull_10_50 + follow_bullish + h10d: Sharpe 0.883, 56.5% win
+  #   ma_cross_bull_20_100 + follow_bullish + h10d: Sharpe 0.881, 56.1% win
+  alert_whitelist: [gap_up, ma_cross_bull_10_50, ma_cross_bull_20_100]
 
   # ── Per-horizon threshold overrides ───────────────────────────────────────────
   # Applied by _apply_variant() at startup based on the active model horizon.
-  # Derived from backtest results (results/reports/ml_metrics.csv):
-  #
-  #   horizon  AUC    hit_rate  sharpe  base_rate  → threshold reasoning
-  #   h1d      0.605  0.561     0.938   0.372      → 0.60 = +22pp above base (baseline)
-  #   h3d      0.597  0.574     0.620   0.439      → 0.63 = same normalised lift as h1d
-  #   h5d      0.586  0.555     0.459   0.460      → 0.65 = same normalised lift as h1d
-  #
-  # Raising h3d/h5d thresholds compensates for their higher base failure rates —
-  # a raw 0.60 threshold is weaker signal for h3d/h5d than for h1d.
+  # fade_threshold: P(fail) >= threshold → FADE (crowding gate still required).
+  # follow_threshold: P(fail) <= threshold → FOLLOW.
   h1d:
     fade_threshold: 0.60
     follow_threshold: 0.40
     win_rate_target: 0.55
 
   h3d:
-    fade_threshold: 0.63     # higher base_rate (0.44) → need more lift to match h1d signal quality
-    follow_threshold: 0.37
-    win_rate_target: 0.57    # slightly higher — h3d hit_rate 0.574 in backtest
+    fade_threshold: 0.60
+    follow_threshold: 0.40
+    win_rate_target: 0.57
 
   h5d:
-    fade_threshold: 0.65     # highest base_rate (0.46) → need most lift
-    follow_threshold: 0.35
-    win_rate_target: 0.55    # conservative — h5d sharpe 0.459, more noise
+    fade_threshold: 0.60
+    follow_threshold: 0.40
+    win_rate_target: 0.55
 
-  # Crowding gate (Barber & Odean, 2008):
-  #   Only FADE when attention conditions are elevated — vol surge, price extreme,
-  #   or multiple concurrent alerts. Low-crowding signals are skipped even if
-  #   P(failure) is high, because the model may be flagging a regime shift.
-  #   0.30 requires at least one strong indicator (e.g. vol >= 2x avg).
-  crowding_min_score: 0.30
-
-  # Regime-aware threshold boost (Lopez de Prado, 2018):
-  #   When the broad market is trending IN THE SAME DIRECTION as the alert,
-  #   we raise the fade threshold to avoid fading institutional momentum.
-  #   E.g. bullish alert in uptrend → effective threshold = 0.60 + 0.05 = 0.65
-  regime_threshold_boost: 0.05
+  # h10d (swing/trend, 10-day hold): optimizer top pick.
+  #   gap_up FOLLOW: 58.6% win, Sharpe 0.891 (2556 OOS trades)
+  #   MA cross FOLLOW: 56.1-56.5% win, Sharpe 0.881-0.883
+  h10d:
+    fade_threshold: 0.60    # OOS results support tight fade threshold
+    follow_threshold: 0.40
+    win_rate_target: 0.57   # target: above 0.55 based on OOS results
 
 model:
   # Active model variant. Format: h{horizon}d_{mode}
-  #   horizon : 1d (intraday, default) | 3d (swing) | 5d (multi-day position)
-  #   mode    : longonly (BUY entries only) | both (BUY + SELL direction scoring)
+  #   horizon  : 1d | 3d | 5d | 10d  — forward return window used for labels
+  #   mode     : longonly (bearish alerts → FADE=BUY)  | both (BUY+SELL FADE)
   #
-  # Default variant: h1d_both — uses the better-calibrated model trained on both
-  # alert directions (AUC=0.605, signals up to ~0.70+) while trading long-only.
-  #   - allow_short=false (below) blocks SELL entries at the executor level
-  #   - follow_disabled=true (below) blocks FOLLOW signals until enough data
-  #   - Only FADE-on-bearish-alert → BUY entries are placed
-  #
-  # h1d_longonly is NOT recommended as default: XGBoost early stopping causes
-  # max predictions ~0.51, never reaching the 0.60 fade threshold — no trades.
-  #
-  # To enable shorting: set allow_short=true below (confirm IBKR locate first).
-  variant: "h1d_both"
+  # Core thesis (Barber & Odean 2008): all models predict P(alert failure).
+  #   longonly = bearish alerts only; agent fades them (BUY contrarian)
+  #   both     = all directional alerts; FADE=BUY (bearish) + FADE=SELL (bullish)
+  # Active variant: h10d_longonly — trained on gap_up + MA cross bull alerts,
+  # predicts P(failure) over 10-day hold. Optimizer pick:
+  #   Sharpe 0.891, 58.6% win rate, 2556 OOS trades (gap_up, 7-year data).
+  variant: "h10d_longonly"
   # Paths are derived from variant — change variant above, not paths below.
-  path: "data/model/xgboost_h1d_both.joblib"
-  feature_cols_path: "data/model/feature_cols_h1d_both.json"
+  path: "data/model/xgboost_h10d_longonly.joblib"
+  feature_cols_path: "data/model/feature_cols_h10d_longonly.json"
   min_history_days: 252
 
   # Learning loop — optimised for active paper trading (5 trades/day → fast feedback)
-  max_hold_days: 3                    # Close multi-day losing positions after this many days
+  max_hold_days: 10                   # Close multi-day losing positions after this many days (h10d horizon)
   retrain_frequency_days: 30          # Retrain after N calendar days since last retrain
   retrain_min_trades: 30              # OR retrain after N completed trades since last retrain
   retrain_min_trading_days: 15        # OR retrain after N distinct trading days since last retrain

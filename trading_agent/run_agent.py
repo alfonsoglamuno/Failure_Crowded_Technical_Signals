@@ -2,19 +2,24 @@
 Trading agent main entry point.
 
 Usage:
-    python run_agent.py --paper                      # interactive variant selection + paper trading
-    python run_agent.py --paper --variant h3d_longonly  # skip menu, use specific variant
-    python run_agent.py --live                       # live trading (confirm required)
-    python run_agent.py --status                     # print journal summary, no trading
-    python run_agent.py --paper --once               # run one cycle now
+    python run_agent.py --paper                        # interactive variant selection + paper trading
+    python run_agent.py --paper --variant h10d_longonly  # skip menu, use specific variant
+    python run_agent.py --live                         # live trading (confirm required)
+    python run_agent.py --status                       # print journal summary, no trading
+    python run_agent.py --paper --once                 # run one cycle now
 
-Model variants (horizon x direction mode):
-    h1d_longonly   1-day hold, BUY-only (fastest intraday fades)
-    h3d_longonly   3-day hold, BUY-only  ← default
-    h5d_longonly   5-day hold, BUY-only  — multi-day positions
-    h1d_both       1-day hold, BUY+SELL  (allow_short=true required)
-    h3d_both       3-day hold, BUY+SELL
-    h5d_both       5-day hold, BUY+SELL
+Core thesis (Barber & Odean 2008): model predicts P(alert failure).
+High P(failure) + crowding → FADE (go against signal). Low P(failure) → FOLLOW.
+
+Model variants (P(failure) / fade-crowded-signals mode):
+    h1d_longonly     1-day hold, bearish→FADE=BUY  — EOD close
+    h3d_longonly     3-day hold, bearish→FADE=BUY  — swing, no shorts
+    h5d_longonly     5-day hold, bearish→FADE=BUY  — multi-day positions
+    h10d_longonly    10-day hold, bearish→FADE=BUY — optimizer top pick
+    h1d_both         1-day hold, FADE BUY+SELL  — allow_short=true
+    h3d_both         3-day hold, FADE BUY+SELL  — allow_short=true
+    h5d_both         5-day hold, FADE BUY+SELL  — allow_short=true
+    h10d_both        10-day hold, FADE BUY+SELL — allow_short=true
 
 Continuous intraday loop:
     - Fast cycle (5 min):  trail stops, time exits, exit sync
@@ -67,7 +72,7 @@ _MAX_STALE_TICKER_FRACTION = 0.20   # >20% stale → halt
 # Horizon-dependent correlation thresholds.
 # Intraday (h1d): positions close EOD — overlap risk is low, gate is soft.
 # Swing/position (h3d, h5d): positions can overlap for days — gate is tighter.
-_PEER_CORR_THRESHOLD = {1: 0.85, 3: 0.70, 5: 0.65}
+_PEER_CORR_THRESHOLD = {1: 0.85, 3: 0.70, 5: 0.65, 10: 0.60}
 _PEER_CORR_WINDOW    = 20     # trading days for correlation lookback
 
 
@@ -135,7 +140,7 @@ def _corr_threshold(horizon_days: int) -> float:
 
 
 def _parse_horizon(variant: str) -> int:
-    """Extract hold horizon in days from variant name (e.g. 'h3d_longonly' -> 3)."""
+    """Extract hold horizon in days from variant name (e.g. 'h10d_longonly' -> 10)."""
     try:
         return int(variant.split("d_")[0].lstrip("h"))
     except Exception:
@@ -208,12 +213,14 @@ def _max_corr_with_open(candidate: str,
 # ── Model variant helpers ─────────────────────────────────────────────────────
 
 _VARIANTS = [
-    ("h1d_longonly", "1-day hold, BUY-only  — intraday fades, EOD close [default]"),
-    ("h3d_longonly", "3-day hold, BUY-only  — swing fades, no shorts"),
-    ("h5d_longonly", "5-day hold, BUY-only  — multi-day positions"),
-    ("h1d_both",     "1-day hold, BUY+SELL  — requires allow_short=true"),
-    ("h3d_both",     "3-day hold, BUY+SELL  — requires allow_short=true"),
-    ("h5d_both",     "5-day hold, BUY+SELL  — requires allow_short=true"),
+    ("h1d_longonly",  "1-day hold, BUY-only  — all entries BUY, EOD close"),
+    ("h3d_longonly",  "3-day hold, BUY-only  — swing, no shorts"),
+    ("h5d_longonly",  "5-day hold, BUY-only  — multi-day positions"),
+    ("h10d_longonly", "10-day hold, BUY-only — optimizer top pick"),
+    ("h1d_both",      "1-day hold, BUY+SELL  — allow_short=true"),
+    ("h3d_both",      "3-day hold, BUY+SELL  — allow_short=true"),
+    ("h5d_both",      "5-day hold, BUY+SELL  — allow_short=true"),
+    ("h10d_both",     "10-day hold, BUY+SELL — allow_short=true"),
 ]
 
 
@@ -227,19 +234,9 @@ def _variant_paths(model_dir: Path, variant: str) -> tuple[Path, Path]:
 def _apply_variant(cfg: dict, variant: str) -> None:
     """Rewrite model paths in cfg based on variant name. Exits if not found.
 
-    The variant name encodes two independent axes:
-      horizon  : h1d / h3d / h5d — how long the model was trained to predict
-      mode     : _both / _longonly — whether the model scored both alert
-                 directions during training, or only long-side alerts
-
-    Execution restrictions (allow_short, follow_disabled) are controlled
-    separately by the strategy config, NOT forced by the variant:
-      - _longonly variants hard-enforce allow_short=False and follow_disabled=True
-        because the model was never trained to score short entries.
-      - _both variants leave allow_short / follow_disabled at whatever the
-        config says.  This lets you use the better-calibrated _both model
-        (more signals, higher AUC) while still trading long-only by keeping
-        allow_short=false in config.
+    Core thesis (Barber & Odean 2008): model predicts P(alert failure).
+      _longonly variants → bearish alerts only; FADE = BUY contrarian; allow_short=False
+      _both variants     → all directional alerts; FADE = BUY or SELL; allow_short from config
     """
     model_dir = Path(cfg["model"]["path"]).parent
     model_path, cols_path = _variant_paths(model_dir, variant)
@@ -254,29 +251,20 @@ def _apply_variant(cfg: dict, variant: str) -> None:
     cfg["model"]["path"]              = str(model_path)
     cfg["model"]["feature_cols_path"] = str(cols_path)
 
-    if variant.endswith("_longonly"):
-        # Hard restrictions: longonly model was never trained on short entries
-        cfg["strategy"]["allow_short"]     = False
-        cfg["strategy"]["follow_disabled"] = True
-        log.info("Variant %s → allow_short=False  follow_disabled=True", variant)
-    elif variant.endswith("_both"):
-        # Execution mode stays as configured — _both only describes the model.
-        # allow_short and follow_disabled are read from config/learner state.
-        log.info("Variant %s → allow_short=%s  follow_disabled=%s (from config)",
-                 variant,
-                 cfg["strategy"].get("allow_short", False),
-                 cfg["strategy"].get("follow_disabled", True))
+    if "both" in variant.split("_")[1:]:
+        # Long+short mode — allow_short stays as configured
+        log.info("Variant %s → allow_short=%s (both, FADE BUY+SELL)",
+                 variant, cfg["strategy"].get("allow_short", False))
+    elif "longonly" in variant:
+        # Long-only mode — hard-enforce no shorts
+        cfg["strategy"]["allow_short"] = False
+        log.info("Variant %s → allow_short=False (longonly, FADE=BUY only)", variant)
     else:
-        log.warning("Unrecognised variant suffix in '%s' — "
-                    "allow_short/follow_disabled not changed", variant)
+        log.warning("Unrecognised variant suffix in '%s' — allow_short not changed", variant)
 
-    # ── Per-horizon strategy thresholds ───────────────────────────────────────
-    # Read horizon-specific fade/follow thresholds and win_rate_target from
-    # config (strategy.h1d / h3d / h5d blocks) and apply them to top-level
-    # strategy keys so all downstream code sees the right values.
-    # These compensate for differing base failure rates across horizons:
-    #   h1d base=0.37 → threshold 0.60; h3d base=0.44 → 0.63; h5d base=0.46 → 0.65
-    horizon_key = variant[:3]   # "h1d", "h3d", or "h5d"
+    # ── Per-horizon fade/follow thresholds from config ────────────────────────
+    # variant format: h{N}d_{mode}  e.g. "h10d_longonly" → horizon_key="h10d"
+    horizon_key = variant.split("_")[0]  # "h1d", "h3d", "h5d", "h10d"
     hz_cfg = cfg["strategy"].get(horizon_key, {})
     if hz_cfg:
         for key in ("fade_threshold", "follow_threshold", "win_rate_target"):
@@ -290,7 +278,26 @@ def _apply_variant(cfg: dict, variant: str) -> None:
             cfg["strategy"].get("win_rate_target", 0.55),
         )
 
-    log.info("Active model variant: %s", variant)
+    # ── Load strategy_recommendation.yaml overrides (if present) ─────────────
+    # Keyed by full variant name (e.g. "h10d_longonly", "h1d_both")
+    rec_file = Path("results/strategy_recommendation.yaml")
+    if rec_file.exists():
+        try:
+            with open(rec_file) as f:
+                rec = yaml.safe_load(f)
+            rec_cfg = rec.get(variant, {}) or {}
+            if rec_cfg.get("alert_whitelist"):
+                cfg["strategy"]["alert_whitelist"] = rec_cfg["alert_whitelist"]
+                log.info("Loaded alert_whitelist from strategy_recommendation.yaml: %s",
+                         cfg["strategy"]["alert_whitelist"])
+            if rec_cfg.get("fade_threshold"):
+                cfg["strategy"]["fade_threshold"] = rec_cfg["fade_threshold"]
+                log.info("Loaded fade_threshold from strategy_recommendation.yaml: %.3f",
+                         cfg["strategy"]["fade_threshold"])
+        except Exception as e:
+            log.warning("Could not load strategy_recommendation.yaml: %s", e)
+
+    log.info("Active model variant: %s  [P(failure) / fade-crowded-signals]", variant)
 
 
 def _choose_variant_interactive(cfg: dict) -> str:
@@ -299,7 +306,7 @@ def _choose_variant_interactive(cfg: dict) -> str:
     is a terminal.  Returns the chosen variant name.
     """
     model_dir = Path(cfg["model"]["path"]).parent
-    current   = cfg["model"].get("variant", "h3d_longonly")
+    current   = cfg["model"].get("variant", "h10d_longonly")
 
     print("\n" + "=" * 64)
     print("  TRADING AGENT — SELECT MODEL VARIANT")
@@ -434,8 +441,9 @@ def print_status(journal):
     print()
     print("Recent signals:")
     for s in journal.get_recent_signals(5):
+        p_val = s.get("failure_proba") or s.get("profit_proba") or 0.0
         print(f"  {s['date']} {s['ticker']:10s} {s['alert_name']:25s} "
-              f"P={s['failure_proba']:.3f}  {s['action']}")
+              f"P(fail)={p_val:.3f}  {s['action']}")
     print("="*50 + "\n")
 
 
@@ -477,7 +485,7 @@ def run_once(paper: bool, cfg: dict):
     with open(cfg["universe"]["parent_tickers_file"]) as f:
         tickers = yaml.safe_load(f)["tickers"]
 
-    risk = RiskManager(cfg, horizon_days=_parse_horizon(cfg["model"].get("variant", "h1d_both")))
+    risk = RiskManager(cfg, horizon_days=_parse_horizon(cfg["model"].get("variant", "h10d_longonly")))
     learner = AdaptiveLearner(cfg, journal, predictor)
 
     # ── Connect to IBKR ──────────────────────────────────────────────────────
@@ -493,7 +501,7 @@ def run_once(paper: bool, cfg: dict):
     log.info("=" * 60)
     log.info("  MODE    : %s", mode_str)
     log.info("  ACCOUNT : %s", feed.account_id)
-    log.info("  VARIANT : %s  (allow_short=%s)", cfg["model"].get("variant", "h3d_longonly"),
+    log.info("  VARIANT : %s  (allow_short=%s)", cfg["model"].get("variant", "h10d_longonly"),
              cfg["strategy"].get("allow_short", False))
     log.info("=" * 60)
 
@@ -603,23 +611,17 @@ def run_once(paper: bool, cfg: dict):
         # ── Strategy + risk filter ────────────────────────────────────────────
         # Resolve active variant and horizon here so make_signals and the
         # execution loop both use the same value.
-        _active_variant = cfg["model"].get("variant", "h3d_longonly")
+        _active_variant = cfg["model"].get("variant", "h10d_longonly")
         _horizon_days   = _parse_horizon(_active_variant)
 
-        # When follow_disabled=True, set follow_threshold to an impossible value
-        # so make_signals never emits FOLLOW signals.  This is the canonical way
-        # to honour the flag — P(failure) cannot be < 0, so no FOLLOW is emitted.
-        _follow_thr = (
-            0.0 if cfg["strategy"].get("follow_disabled", True)
-            else learner.follow_threshold
-        )
         signals = make_signals(
             feature_df, probas,
             fade_threshold=learner.fade_threshold,
-            follow_threshold=_follow_thr,
+            follow_threshold=learner.follow_threshold,
             horizon_days=_horizon_days,
             crowding_min_score=cfg["strategy"].get("crowding_min_score", 0.30),
             regime_threshold_boost=cfg["strategy"].get("regime_threshold_boost", 0.05),
+            alert_whitelist=cfg["strategy"].get("alert_whitelist") or None,
         )
         signals = filter_signals(
             signals,
@@ -657,7 +659,8 @@ def run_once(paper: bool, cfg: dict):
             action     = found_sig.action           if found_sig else "SKIP"
             trade_dir  = found_sig.trade_direction  if found_sig else None
             conviction = found_sig.conviction       if found_sig else 0.0
-            crowding   = found_sig.crowding_score   if found_sig else 0.0
+
+            crowding_score = found_sig.crowding_score if found_sig else 0.0
 
             # Build explanation only for actionable (non-SKIP) signals
             explanation = ""
@@ -672,7 +675,6 @@ def run_once(paper: bool, cfg: dict):
                         alert_direction=direction,
                         action=action,
                         trade_direction=trade_dir or "",
-                        crowding_score=crowding,
                     )
                     log.info("[WHY] %s", explanation)
                 except Exception as exc:
@@ -686,8 +688,8 @@ def run_once(paper: bool, cfg: dict):
                 action=action,
                 trade_direction=trade_dir,
                 conviction=conviction,
+                crowding_score=crowding_score,
                 trade_date=today,
-                crowding_score=crowding,
                 explanation=explanation,
             )
             signal_id_map[f"{ticker}|{alert_name}"] = sid
@@ -907,7 +909,7 @@ def run_once(paper: bool, cfg: dict):
             )
 
             log.info(
-                "[SIGNAL] %s %s P(failure)=%.3f crowd=%.2f -> %s "
+                "[SIGNAL] %s %s P(fail)=%.3f crowd=%.2f -> %s "
                 "qty=%d  bid=%.4f(%.0fsh) ask=%.4f(%.0fsh)  "
                 "entry=%.4f SL=%.4f TP=%.4f  spread=%.3f%%%s",
                 sig.action, sig.ticker, sig.failure_proba, sig.crowding_score,
@@ -1374,16 +1376,18 @@ def _eod_close(paper: bool, cfg: dict):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Crowded Signal Failure Trading Agent",
+        description="Always-Profit Trading Agent — P(trade is profitable) model",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Model variants:
-  h1d_longonly  1-day hold, BUY-only  — fastest intraday fades
-  h3d_longonly  3-day hold, BUY-only  — default
-  h5d_longonly  5-day hold, BUY-only  — multi-day positions
-  h1d_both      1-day hold, BUY+SELL  — allow_short=true required
-  h3d_both      3-day hold, BUY+SELL
-  h5d_both      5-day hold, BUY+SELL
+Model variants (always-profit mode — all predict P(trade profitable)):
+  h1d_longonly     1-day hold, BUY-only  — all entries BUY, EOD close
+  h3d_longonly     3-day hold, BUY-only  — swing, no shorts
+  h5d_longonly     5-day hold, BUY-only  — multi-day positions
+  h10d_longonly    10-day hold, BUY-only — optimizer top pick  [default]
+  h1d_both         1-day hold, BUY+SELL  — allow_short=true required
+  h3d_both         3-day hold, BUY+SELL
+  h5d_both         5-day hold, BUY+SELL
+  h10d_both        10-day hold, BUY+SELL
 """,
     )
     parser.add_argument("--paper", action="store_true", default=True,
@@ -1397,7 +1401,7 @@ Model variants:
     parser.add_argument("--eod-close", action="store_true",
                         help="Cancel all brackets and close all positions now")
     parser.add_argument("--variant", metavar="VARIANT",
-                        help="Model variant to use (e.g. h3d_longonly, h1d_both). "
+                        help="Model variant to use (e.g. h10d_longonly, h5d_both). "
                              "If omitted an interactive menu is shown on startup.")
     parser.add_argument("--no-menu", action="store_true",
                         help="Skip interactive variant menu, use config default")
@@ -1420,17 +1424,15 @@ Model variants:
         return
 
     # ── Variant selection ─────────────────────────────────────────────────────
-    # _apply_variant is ALWAYS called so that allow_short and follow_disabled
-    # are guaranteed to match the variant suffix, even when the user keeps the
-    # config default.  Without this, a config with variant="h1d_both" but
-    # allow_short=false would silently trade in long-only mode.
+    # _apply_variant is ALWAYS called so that allow_short is guaranteed to match
+    # the variant suffix, even when the user keeps the config default.
     if args.variant:
         _apply_variant(cfg, args.variant)
     elif not args.no_menu and sys.stdin.isatty():
         chosen = _choose_variant_interactive(cfg)
         _apply_variant(cfg, chosen)
     else:
-        _apply_variant(cfg, cfg["model"].get("variant", "h3d_longonly"))
+        _apply_variant(cfg, cfg["model"].get("variant", "h10d_longonly"))
 
     # ── Live trading confirmation ─────────────────────────────────────────────
     if args.live:

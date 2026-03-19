@@ -46,7 +46,7 @@ class FailurePredictor:
 
     def predict(self, feature_df: pd.DataFrame) -> pd.Series:
         """
-        Predict P(failure) for each row.
+        Predict P(trade is profitable) for each row.
         Returns a Series of probabilities indexed the same as feature_df.
         """
         if not self.is_loaded:

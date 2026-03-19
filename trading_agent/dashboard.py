@@ -101,17 +101,16 @@ def section_summary(conn: sqlite3.Connection, cfg: dict) -> str:
     win_rate = wins / n if n else 0
     profit_factor = gw / gl if gl > 0 else float("inf")
 
-    fade_thr  = cfg["strategy"]["fade_threshold"]
-    foll_thr  = cfg["strategy"]["follow_threshold"]
-    foll_dis  = cfg["strategy"].get("follow_disabled", True)
+    fade_thr = cfg["strategy"].get("fade_threshold", cfg["strategy"].get("profit_threshold", 0.60))
 
     learner_path = Path(cfg["model"]["path"]).parent / "learner_state.json"
     alert_stats  = {}
+    follow_thr   = cfg["strategy"].get("follow_threshold", 1.0 - fade_thr)
     if learner_path.exists():
         with open(learner_path) as f:
             ls = json.load(f)
-        fade_thr    = ls.get("fade_threshold", fade_thr)
-        foll_thr    = ls.get("follow_threshold", foll_thr)
+        fade_thr   = ls.get("fade_threshold", fade_thr)
+        follow_thr = ls.get("follow_threshold", 1.0 - fade_thr)
         alert_stats = ls.get("alert_stats", {})
 
     # Identify suppressed alert types (win rate < threshold with enough samples)
@@ -139,11 +138,10 @@ def section_summary(conn: sqlite3.Connection, cfg: dict) -> str:
         f"  Worst trade        : {_pnl_str(worst):>14}",
         f"  Profit factor      : {'inf' if profit_factor == float('inf') else f'{profit_factor:.2f}':>13}",
         "",
-        "  LEARNER STATE",
+        "  LEARNER STATE  [thesis: P(failure) — fade crowded signals]",
         _sep("-"),
-        f"  Fade threshold     : {fade_thr:.3f}   (signal when P(failure) >= this)",
-        f"  Follow threshold   : {foll_thr:.3f}   (signal when P(failure) <= this)",
-        f"  Follow mode        : {'DISABLED' if foll_dis else 'ENABLED'}",
+        f"  Fade threshold     : {fade_thr:.3f}   (FADE when P(fail) >= this + crowding present)",
+        f"  Follow threshold   : {follow_thr:.3f}   (FOLLOW when P(fail) <= this)",
         f"  Config: max {cfg['risk']['max_trades_per_day']} trades/day | "
         f"pos {cfg['risk']['max_position_pct']*100:.0f}% NAV | "
         f"SL {cfg['risk']['stop_loss_pct']*100:.0f}% | "
@@ -284,9 +282,10 @@ def section_open_positions(conn: sqlite3.Connection) -> str:
 def section_todays_signals(conn: sqlite3.Connection) -> str:
     today = str(date.today())
     rows = conn.execute("""
-        SELECT ticker, alert_name, alert_direction, failure_proba,
+        SELECT ticker, alert_name, alert_direction,
+               COALESCE(profit_proba, 0.0) AS failure_proba,
+               crowding_score,
                action, trade_direction, conviction,
-               COALESCE(crowding_score, 0.0) AS crowding_score,
                explanation
         FROM signals
         WHERE date = ?
@@ -299,14 +298,14 @@ def section_todays_signals(conn: sqlite3.Connection) -> str:
     else:
         lines.append(
             f"  {'Ticker':10} {'Alert':28} {'Dir':8} "
-            f"{'P(fail)':>8} {'Crowd':>6} {'Action':7} {'Conv':>6}"
+            f"{'P(fail)':>7} {'Crowd':>6} {'Action':7} {'Conv':>6}"
         )
         lines.append("  " + "-" * 80)
         for r in rows:
             lines.append(
                 f"  {(r['ticker'] or ''):10} {(r['alert_name'] or ''):28} "
-                f"{(r['alert_direction'] or ''):8} {r['failure_proba']:>8.3f} "
-                f"{r['crowding_score']:>6.2f} "
+                f"{(r['alert_direction'] or ''):8} {r['failure_proba']:>7.3f} "
+                f"{(r['crowding_score'] or 0.0):>6.2f} "
                 f"{(r['action'] or 'SKIP'):7} {(r['conviction'] or 0.0):>6.3f}"
             )
             # Show explanation on a second line for traded signals
@@ -324,8 +323,9 @@ def section_trade_rationale(conn: sqlite3.Connection, n: int = 10) -> str:
     rows = conn.execute("""
         SELECT t.date, t.ticker, s.action, t.trade_direction,
                t.entry_price, t.exit_price, t.pnl_net,
-               COALESCE(s.crowding_score, 0.0) AS crowding_score,
-               s.failure_proba, s.explanation
+               COALESCE(s.profit_proba, 0.0) AS failure_proba,
+               s.crowding_score,
+               s.explanation
         FROM trades t
         LEFT JOIN signals s ON t.signal_id = s.id
         WHERE t.exit_price IS NOT NULL
@@ -352,8 +352,7 @@ def section_trade_rationale(conn: sqlite3.Connection, n: int = 10) -> str:
                 lines.append(f"    -> {wrapped}")
             else:
                 lines.append(
-                    f"    -> P(fail)={r['failure_proba']:.2f}  "
-                    f"crowd={r['crowding_score']:.2f}  (no explanation stored)"
+                    f"    -> P(fail)={r['failure_proba']:.2f}  crowd={r['crowding_score'] or 0.0:.2f}  (no explanation stored)"
                 )
     return "\n".join(lines)
 

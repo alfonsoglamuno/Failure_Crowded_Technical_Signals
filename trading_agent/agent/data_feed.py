@@ -81,7 +81,7 @@ class IBKRFeed:
     def get_account_summary(self) -> dict:
         # Request all account values (no account filter) — paper accounts use an
         # internal ID (e.g. DUP451913) that differs from the external account number
-        # (U24843486), so filtering by account_id may return nothing.
+        # (UXXXXXX), so filtering by account_id may return nothing.
         all_items = self.ib.accountSummary()
         result = {}
         cfg_currency = self.cfg["capital"]["currency"]

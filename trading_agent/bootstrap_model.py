@@ -2,28 +2,42 @@
 Bootstrap script — fetches historical data, runs the full research pipeline,
 and saves trained XGBoost models ready for the agent.
 
-Model variants are defined by two axes:
-  horizon  : 1d / 3d / 5d  — forward return window used for labels
-  mode     : longonly / both — which signal directions are included in training
-               longonly  trains only on bearish alerts  (FADE → BUY)
-               both      trains on all alert directions (FADE → BUY or SELL)
+Core thesis (Barber & Odean 2008 + Lopez de Prado 2018):
+  When a technical signal is widely noticed and acted upon (crowded), it tends
+  to fail to follow through. ALL models predict P(alert failure) — not P(profit).
+  High P(failure) + crowding present → FADE (go against signal direction).
+  Low P(failure) → FOLLOW (go with signal direction).
 
-Six models are trained and saved:
-  xgboost_h1d_longonly.joblib   feature_cols_h1d_longonly.json
-  xgboost_h3d_longonly.joblib   feature_cols_h3d_longonly.json  ← default
-  xgboost_h5d_longonly.joblib   feature_cols_h5d_longonly.json
-  xgboost_h1d_both.joblib       feature_cols_h1d_both.json
-  xgboost_h3d_both.joblib       feature_cols_h3d_both.json
-  xgboost_h5d_both.joblib       feature_cols_h5d_both.json
+Model variants are defined by two axes:
+  horizon  : 1d / 3d / 5d / 10d  — forward return window used for labels
+  mode     : longonly / both      — entry direction
+
+    longonly  trains on bearish + neutral alerts (FADE bearish → BUY contrarian).
+              label = label_failure_{h}d  — P(bearish signal fails = price goes up)
+              Optionally filtered to an alert_whitelist from optimize_strategy.py.
+
+    both      trains on all directional alerts (bullish + bearish), BUY + SELL entries.
+              label = label_failure_{h}d  — P(signal fails to follow through)
+              FADE=BUY (bearish) and FADE=SELL (bullish) both trained.
+              Use with allow_short=true for long+short trading.
+
+Models saved (examples):
+  xgboost_h1d_longonly.joblib      feature_cols_h1d_longonly.json
+  xgboost_h3d_longonly.joblib      feature_cols_h3d_longonly.json
+  xgboost_h5d_longonly.joblib      feature_cols_h5d_longonly.json
+  xgboost_h10d_longonly.joblib     feature_cols_h10d_longonly.json  ← default
+  xgboost_h1d_both.joblib          feature_cols_h1d_both.json
+  ...
 
 After training, set model.variant in configs/config.yaml to select which
-model the agent uses (e.g. "h3d_longonly" for intraday-ish long-only).
+model the agent uses (e.g. "h10d_longonly" for fade-crowded-signals long-only).
 
 Usage:
-    python bootstrap_model.py --yfinance             # train all 6 variants
-    python bootstrap_model.py --yfinance --variant h3d_longonly  # one variant
-    python bootstrap_model.py --paper                # IBKR paper port
-    python bootstrap_model.py --live                 # IBKR live port
+    python bootstrap_model.py --yfinance                             # train all variants
+    python bootstrap_model.py --yfinance --variant h10d_longonly     # one variant
+    python bootstrap_model.py --yfinance --variant h3d_longonly --alert-whitelist rsi_oversold,macd_bullish
+    python bootstrap_model.py --paper                                # IBKR paper port
+    python bootstrap_model.py --live                                 # IBKR live port
 """
 
 import argparse
@@ -43,14 +57,18 @@ import joblib
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-# All variants: (horizon_days, mode)
+# All variants: (horizon_days, mode) — P(failure) labels (Barber & Odean thesis)
+# mode "longonly" = bearish alerts only → FADE = BUY contrarian
+# mode "both"     = all directional alerts → FADE = BUY or SELL
 ALL_VARIANTS = [
-    (1, "longonly"),
-    (3, "longonly"),
-    (5, "longonly"),
-    (1, "both"),
-    (3, "both"),
-    (5, "both"),
+    (1,  "longonly"),   # bearish alerts only → FADE = BUY
+    (3,  "longonly"),
+    (5,  "longonly"),
+    (10, "longonly"),
+    (1,  "both"),       # all directional alerts → FADE = BUY or SELL
+    (3,  "both"),
+    (5,  "both"),
+    (10, "both"),
 ]
 
 
@@ -113,20 +131,34 @@ def _fetch_yfinance(tickers: list[str], days: int, cache_dir: str | None) -> dic
 
 
 def _build_feature_matrix(labeled: pd.DataFrame, feat_panel: pd.DataFrame,
-                           horizon: int, mode: str) -> tuple:
+                           horizon: int, mode: str,
+                           alert_whitelist: list | None = None) -> tuple:
     """
-    Build (X, y, feat_cols) for a specific training variant.
+    Build (X, y, feat_cols, dates) for a specific training variant.
 
-    mode = "longonly"  → only train on bearish alerts (FADE → BUY).
-                         These are the signals the long-only agent actually trades.
-                         Training on matching examples gives better calibration.
-    mode = "both"      → train on all signal directions. Use this model when
-                         allow_short=True so it sees SELL-side failure events too.
+    Core thesis: predict P(alert failure) to fade crowded signals (Barber & Odean 2008).
+    ALL models predict P(alert failure) — not P(profit).
+
+    mode = "longonly" → train on bearish + neutral alerts.
+                        FADE bearish → BUY contrarian; label = P(bearish signal fails = price goes up).
+                        label: label_failure_{h}d  (1 = signal failed to follow through)
+                        Optionally filtered to alert_whitelist from optimize_strategy.py.
+
+    mode = "both"     → train on all directional alerts (bullish + bearish), BUY + SELL entries.
+                        label: label_failure_{h}d  — P(signal fails to follow through)
+                        FADE=BUY (bearish) and FADE=SELL (bullish) both trained.
+                        Use with allow_short=True — long+short trading.
+
+    alert_whitelist   → optional list of alert_name strings; restrict training to these types.
     """
     EXCLUDE = {
         "date", "ticker", "open", "high", "low", "close", "volume",
-        "ret_1d_lead", "fwd_ret_1d", "fwd_ret_3d", "fwd_ret_5d",
+        "ret_1d_lead", "fwd_ret_1d", "fwd_ret_2d", "fwd_ret_3d", "fwd_ret_5d", "fwd_ret_10d",
         "alert_name", "direction", "n_simultaneous_alerts", "_dir_raw",
+        # Exclude all label columns to prevent leakage
+        "label_failure_1d", "label_failure_3d", "label_failure_5d", "label_failure_10d",
+        "label_profitable_1d", "label_profitable_3d", "label_profitable_5d", "label_profitable_10d",
+        "label_profitable_fade_1d", "label_profitable_fade_3d", "label_profitable_fade_5d", "label_profitable_fade_10d",
     }
 
     price_feat_cols = [c for c in feat_panel.columns if c not in EXCLUDE]
@@ -136,13 +168,46 @@ def _build_feature_matrix(labeled: pd.DataFrame, feat_panel: pd.DataFrame,
     lab = labeled.copy()
     lab["date"] = pd.to_datetime(lab["date"])
 
-    # Direction filter
+    # P(failure) label column — same for both modes
+    label_col = f"label_failure_{horizon}d"
+
+    # Direction filter and label construction
     if mode == "longonly":
-        # Keep only bearish alerts (oversold/breakdown) → FADE produces BUY entries.
-        # Also keep neutral for context; exclude bullish-only (those are FOLLOW=BUY
-        # or FADE=SELL which long-only never trades).
+        # Bearish + neutral alerts: FADE bearish → BUY contrarian.
+        # Model predicts P(bearish signal fails = price goes up).
         lab = lab[lab["direction"].isin(["bearish", "neutral"])].copy()
-        log.info("  [longonly] filtered to bearish+neutral: %d events", len(lab))
+        log.info("  [longonly] using bearish+neutral: %d events", len(lab))
+
+        # Optional whitelist filter
+        if alert_whitelist:
+            before = len(lab)
+            lab = lab[lab["alert_name"].isin(alert_whitelist)].copy()
+            log.info("  [longonly] alert_whitelist filtered: %d → %d events", before, len(lab))
+
+        if label_col not in lab.columns:
+            log.error("Failure label column %s not found — skipping", label_col)
+            return None, None, None, None
+
+    elif mode == "both":
+        # All directional alerts (bullish + bearish), BUY + SELL entries.
+        # Model predicts P(signal fails to follow through).
+        # FADE=BUY (bearish) and FADE=SELL (bullish) both trained.
+        # Use with allow_short=True — long+short trading.
+        lab = lab[lab["direction"].isin(["bullish", "bearish"])].copy()
+        log.info("  [both] using bullish+bearish: %d events", len(lab))
+
+        if alert_whitelist:
+            before = len(lab)
+            lab = lab[lab["alert_name"].isin(alert_whitelist)].copy()
+            log.info("  [both] alert_whitelist filtered: %d → %d events", before, len(lab))
+
+        if label_col not in lab.columns:
+            log.error("Failure label column %s not found — skipping", label_col)
+            return None, None, None, None
+
+    else:
+        log.error("Unknown mode '%s' — skipping", mode)
+        return None, None, None, None
 
     lab["_dir_raw"] = lab["direction"]
     lab = pd.get_dummies(lab, columns=["direction", "alert_name"], drop_first=False)
@@ -164,10 +229,9 @@ def _build_feature_matrix(labeled: pd.DataFrame, feat_panel: pd.DataFrame,
     )
     feat_cols = [c for c in feat_cols if merged[c].dtype != object]
 
-    label_col = f"label_failure_{horizon}d"
     if label_col not in merged.columns:
         log.error("Label column %s not found — skipping", label_col)
-        return None, None, None
+        return None, None, None, None
 
     valid = merged[label_col].notna()
     X = merged.loc[valid, feat_cols].fillna(-1)
@@ -224,9 +288,9 @@ def _train_one_variant(X, y, feat_cols: list, horizon: int, mode: str,
                  halflife_days, sample_weight.min(), sample_weight.max())
 
     # h1d: lighter model — horizon is very short, fewer trees needed to avoid overfit
-    # h5d: deeper trees — more regime context captured at longer horizons
-    max_depth    = {1: 4, 3: 5, 5: 6}.get(horizon, 5)
-    n_estimators = {1: 600, 3: 1000, 5: 800}.get(horizon, 1000)
+    # h10d: deeper trees — more regime context captured at longer horizons
+    max_depth    = {1: 4, 3: 5, 5: 6, 10: 6}.get(horizon, 5)
+    n_estimators = {1: 600, 3: 1000, 5: 800, 10: 1000}.get(horizon, 1000)
 
     model = XGBClassifier(
         n_estimators=n_estimators,
@@ -274,7 +338,8 @@ def _train_one_variant(X, y, feat_cols: list, horizon: int, mode: str,
 
 
 def main(paper: bool = True, use_yfinance: bool = False,
-         target_variant: str | None = None):
+         target_variant: str | None = None,
+         alert_whitelist: list | None = None):
     # ── Load config ─────────────────────────────────────────────────────────
     with open("configs/config.yaml") as f:
         cfg = yaml.safe_load(f)
@@ -289,7 +354,7 @@ def main(paper: bool = True, use_yfinance: bool = False,
     if target_variant:
         parts = target_variant.split("_", 1)
         if len(parts) != 2 or not parts[0].startswith("h"):
-            log.error("Invalid variant format. Use e.g. 'h3d_longonly' or 'h1d_both'")
+            log.error("Invalid variant format. Use e.g. 'h10d_longonly' or 'h5d_both'")
             sys.exit(1)
         horizon = int(parts[0][1:-1])
         mode = parts[1]
@@ -369,19 +434,28 @@ def main(paper: bool = True, use_yfinance: bool = False,
     from src.alerts.engine import run_alert_engine
     from src.features.engineering import add_alert_features
 
+    # Determine full set of horizons needed across all requested variants
+    _horizons_needed = sorted({h for h, _m in variants_to_train})
+    # Always include at minimum 1, 3, 5 for backward compat; add 2, 10 when profit variants present
+    _base_horizons = {1, 3, 5}
+    _all_horizons  = sorted(_base_horizons | set(_horizons_needed))
+
     log.info("Building features (this may take 1-2 minutes for 2yr / 49 tickers)...")
     feat_panel = build_features(panel, index_close=index_close)
-    feat_panel = compute_forward_returns(feat_panel, horizons=[1, 3, 5])
+    feat_panel = compute_forward_returns(feat_panel, horizons=_all_horizons)
 
     events = run_alert_engine(panel)
     events = add_alert_features(events, panel)
-    labeled = assign_labels(events, feat_panel, horizons=[1, 3, 5], theta=0.005)
+    labeled = assign_labels(events, feat_panel, horizons=_all_horizons, theta=0.005)
 
-    log.info("Labeled events: %d  failure_rate 1d=%.3f  3d=%.3f  5d=%.3f",
-             len(labeled),
-             labeled["label_failure_1d"].mean(),
-             labeled["label_failure_3d"].mean(),
-             labeled["label_failure_5d"].mean())
+    _avail_failure_cols = [f"label_failure_{h}d" for h in [1, 3, 5] if f"label_failure_{h}d" in labeled.columns]
+    if _avail_failure_cols:
+        _fail_info = "  ".join(
+            f"{c}={labeled[c].mean():.3f}" for c in _avail_failure_cols
+        )
+        log.info("Labeled events: %d  failure_rates: %s", len(labeled), _fail_info)
+    else:
+        log.info("Labeled events: %d", len(labeled))
 
     # ── Step 4-5: Train all requested variants ────────────────────────────────
     model_dir = Path(cfg["model"]["path"]).parent
@@ -390,7 +464,11 @@ def main(paper: bool = True, use_yfinance: bool = False,
     halflife = cfg["model"].get("sample_weight_halflife_days", 252)
 
     for horizon, mode in variants_to_train:
-        X, y, feat_cols, dates = _build_feature_matrix(labeled, feat_panel, horizon, mode)
+        # Pass alert_whitelist to all variants
+        _wl = alert_whitelist if mode in ("longonly", "both") else None
+        X, y, feat_cols, dates = _build_feature_matrix(
+            labeled, feat_panel, horizon, mode, alert_whitelist=_wl
+        )
         if X is None:
             log.warning("Skipping variant %s — feature matrix build failed",
                         variant_name(horizon, mode))
@@ -405,11 +483,11 @@ def main(paper: bool = True, use_yfinance: bool = False,
         log.info("  %s", f.name)
 
     # Show current active variant from config
-    active = cfg["model"].get("variant", "h3d_longonly")
+    active = cfg["model"].get("variant", "h10d_longonly")
     active_path, active_cols = variant_paths(model_dir, *_parse_variant(active))
     if active_path.exists():
         log.info("")
-        log.info("Active variant in config: %s", active)
+        log.info("Active variant in config: %s  [P(failure) model — fade crowded signals]", active)
         log.info("  model     : %s", active_path)
         log.info("  feat cols : %s", active_cols)
     else:
@@ -421,24 +499,27 @@ def main(paper: bool = True, use_yfinance: bool = False,
 
 
 def _parse_variant(variant: str) -> tuple[int, str]:
-    """Parse 'h3d_longonly' → (3, 'longonly')."""
+    """Parse 'h10d_longonly' → (10, 'longonly').  Works for all variants."""
     parts = variant.split("_", 1)
     return int(parts[0][1:-1]), parts[1]
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Bootstrap XGBoost models for the trading agent",
+        description="Bootstrap XGBoost models for the trading agent (P(failure) / fade-crowded-signals mode)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Variants trained (horizon x direction mode):
-  h1d_longonly  h3d_longonly*  h5d_longonly
-  h1d_both      h3d_both       h5d_both
+Variants trained (horizon x mode) — P(failure) labels (Barber & Odean thesis):
+  h1d_longonly    h3d_longonly    h5d_longonly    h10d_longonly*
+  h1d_both        h3d_both        h5d_both        h10d_both
 
   *default active variant (set via model.variant in config.yaml)
 
-longonly: train on bearish alerts only → FADE=BUY. Use when allow_short=false.
-both:     train on all directions      → FADE=BUY or SELL. Use when allow_short=true.
+longonly:  train on bearish+neutral alerts; agent fades them (BUY contrarian).
+           Label = P(bearish signal fails = price goes up).
+           Use with optimize_strategy.py --alert-whitelist to restrict alert types.
+both:      train on all directional alerts, BUY + SELL FADE entries.
+           Label = P(signal fails to follow through). Use with allow_short=true.
 """,
     )
     src = parser.add_mutually_exclusive_group()
@@ -450,13 +531,27 @@ both:     train on all directions      → FADE=BUY or SELL. Use when allow_shor
                      help="Use IBKR live trading port (4001)")
     parser.add_argument(
         "--variant", metavar="VARIANT",
-        help="Train only one variant e.g. h3d_longonly (default: train all 6)"
+        help="Train only one variant e.g. h10d_longonly or h5d_both (default: train all)"
+    )
+    parser.add_argument(
+        "--alert-whitelist", metavar="ALERTS",
+        help=(
+            "Comma-separated alert names to restrict training. "
+            "Example: rsi_oversold,macd_bullish,gap_up,breakout_low_20. "
+            "Obtain from: python optimize_strategy.py --yfinance"
+        ),
     )
     args = parser.parse_args()
 
+    # Parse alert whitelist
+    _whitelist = None
+    if args.alert_whitelist:
+        _whitelist = [a.strip() for a in args.alert_whitelist.split(",") if a.strip()]
+        log.info("Alert whitelist: %s", _whitelist)
+
     if args.yfinance:
-        main(use_yfinance=True, target_variant=args.variant)
+        main(use_yfinance=True, target_variant=args.variant, alert_whitelist=_whitelist)
     elif args.live:
-        main(paper=False, use_yfinance=False, target_variant=args.variant)
+        main(paper=False, use_yfinance=False, target_variant=args.variant, alert_whitelist=_whitelist)
     else:
-        main(paper=True, use_yfinance=False, target_variant=args.variant)
+        main(paper=True, use_yfinance=False, target_variant=args.variant, alert_whitelist=_whitelist)

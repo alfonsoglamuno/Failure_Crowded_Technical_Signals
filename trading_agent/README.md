@@ -1,10 +1,10 @@
 # Failure of Crowded Technical Signals — Trading Agent
 
-Predicts when technical alerts will **fail** and trades the reversal.
-Runs live against IBKR, EURO STOXX 50 cash equities only.
+Predicts **P(trade is profitable)** for each technical alert and trades when the model is confident.
+Runs live against IBKR, EURO STOXX 50 cash equities only. All models use always-profit mode.
 
-> **Default mode: `h1d_longonly` — intraday long-only, EOD close.**
-> No shorts required. No overnight risk. All positions close at 16:30 CET.
+> **Default mode: `h10d_longonly` — 10-day hold, long-only, optimizer-recommended.**
+> No shorts required. No EOD close. Positions held up to 10 days.
 
 ---
 
@@ -24,19 +24,20 @@ On each scan cycle (every 30 min during market hours):
 
 ```
 IBKR data ──► Alert Detection ──► Feature Engineering ──► XGBoost (active variant)
-             (18 signal types)    (80+ features, 9 blocks)    P(failure)
+             (18 signal types)    (80+ features, 9 blocks)    P(trade profitable)
                                                                     │
-                        P(failure) >= threshold ──► FADE ──► contrarian bracket order
-                        P(failure) <= threshold ──► FOLLOW ──► momentum bracket order
-                        otherwise              ──► SKIP
+                     P(profit) >= profit_threshold ──► FADE/FOLLOW ──► bracket order
+                     otherwise                     ──► SKIP
                                                             │
                                                       Journal (SQLite)
                                                             │
                                                       Adaptive Learner
-                                               (recalibrate thresholds,
+                                               (recalibrate profit_threshold,
                                                 retrain monthly or on
                                                 performance degradation)
 ```
+
+All models predict P(trade is profitable) — never P(failure). This is always-profit mode.
 
 Between scans, a 5-minute monitor trails stop-losses and enforces time-based exits.
 
@@ -51,13 +52,16 @@ cd trading_agent && pip install -r requirements.txt
 # 2. Configure credentials
 cp .env.example .env    # fill in IBKR_ACCOUNT, ports
 
-# 3. Train all model variants (~5 min, 7yr data)
+# 3. Find the best strategy variant (outputs strategy_recommendation.yaml)
+python optimize_strategy.py --yfinance
+
+# 4. Train all model variants (~5 min, 7yr data)
 python bootstrap_model.py --yfinance
 
-# 4. Start paper trading — uses h1d_both from config (intraday, EOD close)
+# 5. Start paper trading — uses h10d_longonly (optimizer recommended default)
 python run_agent.py --paper --no-menu
 
-# 5. Emergency: close specific positions manually
+# 6. Emergency: close specific positions manually
 python manage_positions.py --ticker ASML.AS
 python manage_positions.py --eod-close   # flatten everything now
 ```
@@ -74,24 +78,26 @@ When started with `--live`, the agent shows a full disclaimer screen and require
 
 ## Model Variants
 
-Six models across 3 horizons x 2 direction modes. Select with `--variant` or the interactive menu.
+Eight models across 4 horizons x 2 direction modes. Select with `--variant` or the interactive menu.
+
+All models predict **P(trade is profitable)** — always-profit mode.
 
 | Variant | Hold | EOD close | SL | TP | Corr gate | When to use |
 |---------|------|-----------|----|----|-----------|-------------|
-| **`h1d_both`** | **intraday** | **YES (16:27)** | **1.5%** | **2.5%** | **0.85** | **Active default. Long-only with allow_short=false** |
-| `h1d_longonly` | intraday | YES (16:27) | 1.5% | 2.5% | 0.85 | Pure long-only training; lower signal count |
+| **`h10d_longonly`** | **10 days** | **NO** | **5%** | **8%** | **0.60** | **Recommended default (optimizer top pick, Sharpe 0.89)** |
+| `h1d_longonly` | intraday | YES (16:27) | 1.5% | 2.5% | 0.85 | Intraday fades, EOD close, no shorts |
 | `h3d_longonly` | 3 days | NO | 2.5% | 4.0% | 0.70 | Swing fades, positions survive overnight |
 | `h5d_longonly` | 5 days | NO | 3.5% | 6.0% | 0.65 | Multi-day positions, wider SL/TP |
+| `h1d_both` | intraday | YES (16:27) | 1.5% | 2.5% | 0.85 (dir-adj) | Intraday, allow_short=true required |
 | `h3d_both` | 3 days | NO | 2.5% | 4.0% | 0.70 (dir-adj) | Swing, allow_short=true required |
 | `h5d_both` | 5 days | NO | 3.5% | 6.0% | 0.65 (dir-adj) | Position, allow_short=true required |
+| `h10d_both` | 10 days | NO | 5.0% | 8.0% | 0.60 (dir-adj) | Multi-week, allow_short=true required |
 
-**Active variant**: `h1d_both` with `allow_short=false`.
-`both` means the model was trained on all alert directions (more data, better calibration).
-SELL entries are blocked by the executor when `allow_short=false` — only BUY entries execute.
-Closing existing longs (SL/TP/EOD exits) is always allowed regardless of this setting.
+**Recommended default**: `h10d_longonly` — selected by the optimizer based on best risk-adjusted backtest performance. Configure via `model.variant` in `configs/config.yaml` or let `optimize_strategy.py` write `strategy_recommendation.yaml` automatically.
 
-**`longonly`**: trained only on bearish/neutral alerts (fewer training samples, slightly lower AUC).
-Better theoretical match for a long-only book but in practice `h1d_both` outperforms with 7yr data.
+**`longonly`**: trains on all directional alerts (bullish + bearish). All entries are BUY. Bullish alerts → FOLLOW momentum, bearish alerts → FADE contrarian BUY.
+
+**`both`**: trains on all alert directions, BUY + SELL entries. Model predicts P(FADE is profitable). SELL entries are blocked by the executor when `allow_short=false` — only BUY entries execute. Closing existing longs (SL/TP/EOD exits) is always allowed regardless of this setting.
 
 **Hold horizon and EOD behaviour**:
 - h1d: EOD close at 16:27 CET flattens all positions. SL/TP orders use DAY TIF (expire automatically).
@@ -108,16 +114,16 @@ The variant is set in `configs/config.yaml → model.variant`.
 notebooks/01_results_overview.ipynb
 
 # Or run the standalone script:
-python reports/evaluate_models.py --variant h1d_both
+python reports/evaluate_models.py --variant h10d_longonly
 ```
 
 The notebook shows: AUC, precision/recall at multiple thresholds, temporal stability across
 Pre-COVID / COVID / Recovery / Recent windows, feature importance, calibration curves, and break-even analysis.
 
-**Active model results (h1d_both, 7yr data, chronological 80/20 hold-out)**:
-- AUC = 0.605 | P@0.60 = 67% | P@0.65 = 69%
-- Break-even precision (SL=1.5%, TP=2.5%, commission 0.10% rt): ~40%
-- Temporal stability: P@0.60 improves from 50% (Pre-COVID) to 71% (Recent) — model adapts over time
+**Recommended model results (h10d_longonly, optimizer-selected)**:
+- Optimizer metric: Sharpe 0.89 (gap_up alert family)
+- Break-even precision (SL=5%, TP=8%, commission 0.10% rt): ~38%
+- Run `python optimize_strategy.py --yfinance` to reproduce optimizer selection
 
 ---
 
@@ -182,16 +188,16 @@ The `atr_vs_commission` feature (ATR / 0.10% round-trip cost) explicitly models 
 
 Shared limits apply to all models. SL/TP and trail settings are **per-horizon** — each model uses values calibrated to its expected hold duration and typical price range (wider for longer holds):
 
-| Parameter | h1d (intraday) | h3d (swing) | h5d (position) |
-|-----------|---------------|-------------|----------------|
-| Stop-loss | 1.5% | 2.5% | 3.5% |
-| Take-profit | 2.5% | 4.0% | 6.0% |
-| Reward/risk | 1.67:1 | 1.60:1 | 1.71:1 |
-| Trail trigger | 1.0% | 1.5% | 2.0% |
-| Trail step | 0.5% | 0.8% | 1.0% |
-| Time exit | 6.5h open | none | none |
-| EOD flatten | YES 16:27 | NO | NO |
-| SL/TP TIF | DAY | GTC | GTC |
+| Parameter | h1d (intraday) | h3d (swing) | h5d (position) | h10d (multi-week) |
+|-----------|---------------|-------------|----------------|-------------------|
+| Stop-loss | 1.5% | 2.5% | 3.5% | 5.0% |
+| Take-profit | 2.5% | 4.0% | 6.0% | 8.0% |
+| Reward/risk | 1.67:1 | 1.60:1 | 1.71:1 | 1.60:1 |
+| Trail trigger | 1.0% | 1.5% | 2.0% | 3.0% |
+| Trail step | 0.5% | 0.8% | 1.0% | 1.5% |
+| Time exit | 6.5h open | none | none | none |
+| EOD flatten | YES 16:27 | NO | NO | NO |
+| SL/TP TIF | DAY | GTC | GTC | GTC |
 
 | Shared parameter | Value | Notes |
 |-----------------|-------|-------|
@@ -200,15 +206,15 @@ Shared limits apply to all models. SL/TP and trail settings are **per-horizon** 
 | Max open positions | 10 | Slot cap |
 | Max daily loss | 300 EUR | 0.3% of capital |
 | Commission | 0.05% min 2 EUR | IBKR tiered |
-| Fade threshold | 0.60 | Active (h1d_both) |
-| Allow short | false | SELL entries blocked |
+| Profit threshold | 0.55 | Default — recalibrated by adaptive learner |
+| Allow short | false | SELL entries blocked (longonly variants) |
 
 ---
 
 ## Adaptive Learner
 
 ### Fast loop (every 10 completed trades)
-Recalibrates `fade_threshold` based on recent win/loss rate:
+Recalibrates `profit_threshold` based on recent win/loss rate:
 - Win rate < 50% → raise threshold (more selective)
 - Win rate > 65% → lower threshold (capture more signals)
 
@@ -255,12 +261,23 @@ python close_shorts.py --emergency     # flatten everything
 
 ## Bootstrap / Retrain
 
+3-step workflow:
+
 ```bash
-# Train all 6 variants (recommended, ~3 min)
+# Step 1: Find the best strategy (writes strategy_recommendation.yaml)
+python optimize_strategy.py --yfinance
+
+# Step 2: Train all 8 variants (recommended, ~5 min)
 python bootstrap_model.py --yfinance
 
-# Train one variant
-python bootstrap_model.py --yfinance --variant h1d_longonly
+# Step 3: Run the agent (reads model.variant from config or strategy_recommendation.yaml)
+python run_agent.py --paper
+```
+
+Or train a single variant:
+
+```bash
+python bootstrap_model.py --yfinance --variant h10d_longonly
 ```
 
 Retrain after:
@@ -286,7 +303,7 @@ trading_agent/
     ├── alerts.py           ← 18 technical signal detectors
     ├── features.py         ← 80+ feature vector builder (live)
     ├── model.py            ← XGBoost loader/predictor
-    ├── strategy.py         ← FADE / FOLLOW / SKIP logic + crowding gate
+    ├── strategy.py         ← FADE / FOLLOW / SKIP logic (P(profit) threshold)
     ├── risk.py             ← Position sizing, commission model, daily limits
     ├── executor.py         ← IBKR bracket orders + short safety block
     ├── journal.py          ← SQLite trade log

@@ -19,11 +19,11 @@ CREATE TABLE IF NOT EXISTS signals (
     ticker          TEXT NOT NULL,
     alert_name      TEXT,
     alert_direction TEXT,
-    failure_proba   REAL,
+    profit_proba    REAL,    -- DB column name kept for compatibility; semantically = P(alert failure)
     action          TEXT,    -- FADE / FOLLOW / SKIP
     trade_direction TEXT,    -- BUY / SELL / None
     conviction      REAL,
-    crowding_score  REAL,
+    crowding_score  REAL,    -- composite attention score (Barber & Odean, 2008); 0-1
     explanation     TEXT     -- human-readable rationale (SHAP-based)
 );
 
@@ -85,6 +85,7 @@ class Journal:
             for col, typedef in [
                 ("crowding_score", "REAL"),
                 ("explanation",    "TEXT"),
+                ("profit_proba",   "REAL"),  # renamed from failure_proba
             ]:
                 try:
                     conn.execute(f"ALTER TABLE signals ADD COLUMN {col} {typedef}")
@@ -104,16 +105,21 @@ class Journal:
         ticker: str,
         alert_name: str,
         alert_direction: str,
-        failure_proba: float,
+        failure_proba: float,   # P(alert fails to follow through); written to profit_proba DB column
         action: str,
         trade_direction: str | None,
         conviction: float,
-        trade_date: date | None = None,
         crowding_score: float = 0.0,
+        trade_date: date | None = None,
         explanation: str = "",
     ) -> int:
         """Insert or update a signal for today. Upserts on (date, ticker, alert_name)
-        so re-running the agent in the same day doesn't create duplicate log entries."""
+        so re-running the agent in the same day doesn't create duplicate log entries.
+
+        Note: failure_proba is written to the DB column named 'profit_proba' (column
+        was originally named failure_proba, renamed during a transient refactor;
+        semantically it holds P(alert failure) — i.e. the Barber & Odean fade thesis score).
+        """
         ts = datetime.utcnow().isoformat()
         d = str(trade_date or date.today())
         with self._conn() as conn:
@@ -136,7 +142,7 @@ class Journal:
                     if cur_action and cur_action[0] in ("FADE", "FOLLOW"):
                         return existing[0]  # preserve actionable signal
                 conn.execute(
-                    """UPDATE signals SET ts=?, failure_proba=?, action=?,
+                    """UPDATE signals SET ts=?, profit_proba=?, action=?,
                        trade_direction=?, conviction=?, crowding_score=?,
                        explanation=?
                        WHERE id=?""",
@@ -148,7 +154,7 @@ class Journal:
             cur = conn.execute(
                 """INSERT INTO signals
                    (ts, date, ticker, alert_name, alert_direction,
-                    failure_proba, action, trade_direction, conviction,
+                    profit_proba, action, trade_direction, conviction,
                     crowding_score, explanation)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (ts, d, ticker, alert_name, alert_direction,
@@ -261,7 +267,8 @@ class Journal:
         with self._conn() as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT * FROM signals ORDER BY ts DESC LIMIT ?", (n,)
+                """SELECT *, profit_proba AS failure_proba
+                   FROM signals ORDER BY ts DESC LIMIT ?""", (n,)
             ).fetchall()
         return [dict(r) for r in rows]
 
