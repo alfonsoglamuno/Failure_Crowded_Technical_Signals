@@ -58,25 +58,34 @@ def compute_crowding_score(row: pd.Series) -> float:
     Returns a crowding / attention score in [0, 1].
 
     Components (Barber & Odean, 2008):
-      • Volume anomaly  — retail attention proxy (0-0.40)
+      • Volume anomaly      — retail attention proxy (0-0.40)
       • Simultaneous alerts — multiple crowd signals (0-0.30)
-      • Price at 52w extreme — price attention zone (0-0.20)
+      • Price at 20d extreme — price attention zone (0-0.20)
       • Compressed volatility — ATR exhaustion → reversal likely (0-0.10)
 
     A score ≥ 0.30 means at least one strong attention indicator is present.
+
+    Feature name mapping (pipeline produces these names):
+      vol_zscore_20d    — z-score of volume vs 20d mean (high = abnormal volume)
+      n_simultaneous_alerts — count of alerts firing same day for this ticker
+      price_pos_20d     — price position within 20d range [0=low, 1=high]
+      atr_norm_14       — ATR normalised by close price (14-period)
     """
     score = 0.0
 
     # ── Volume component ──────────────────────────────────────────────────────
-    vol = _safe_float(row, "vol_ratio_20d")
-    if vol >= 2.5:
-        score += 0.40
-    elif vol >= 2.0:
-        score += 0.30
-    elif vol >= 1.5:
-        score += 0.20
-    elif vol >= 1.2:
-        score += 0.10
+    # vol_zscore_20d: z-score of today's volume vs 20d average.
+    # z >= 2 ≈ ratio >= 1.5x  (2 standard deviations above mean)
+    vol_z = _safe_float(row, "vol_zscore_20d", default=-99.0)
+    if vol_z > -99.0:   # feature is present
+        if vol_z >= 3.0:
+            score += 0.40   # extreme volume spike (≈ ratio >= 2.5x)
+        elif vol_z >= 2.0:
+            score += 0.30   # strong volume anomaly (≈ ratio >= 2x)
+        elif vol_z >= 1.5:
+            score += 0.20   # notable volume above norm
+        elif vol_z >= 1.0:
+            score += 0.10
 
     # ── Concurrent alerts component ───────────────────────────────────────────
     n_alerts = int(_safe_float(row, "n_simultaneous_alerts", default=1.0))
@@ -85,19 +94,25 @@ def compute_crowding_score(row: pd.Series) -> float:
     elif n_alerts >= 2:
         score += 0.15
 
-    # ── 52-week price extreme component ───────────────────────────────────────
-    pos = _safe_float(row, "price_position_52w")
-    if pos >= 0.90 or pos <= 0.10:
-        score += 0.20
-    elif pos >= 0.80 or pos <= 0.20:
-        score += 0.10
+    # ── Price position at 20d extreme component ───────────────────────────────
+    # price_pos_20d: 0 = at 20d low, 1 = at 20d high.
+    # Extremes indicate crowd attention (people notice new highs/lows).
+    pos = _safe_float(row, "price_pos_20d", default=-1.0)
+    if pos >= 0:    # feature present (default -1 when absent → skipped)
+        if pos >= 0.90 or pos <= 0.10:
+            score += 0.20
+        elif pos >= 0.80 or pos <= 0.20:
+            score += 0.10
 
     # ── Compressed volatility component ───────────────────────────────────────
-    atr = _safe_float(row, "atr_pct_20")
-    if atr < 0.010:
-        score += 0.10
-    elif atr < 0.015:
-        score += 0.05
+    # atr_norm_14: ATR / close price over 14 periods.
+    # Low ATR (< 1%) → coiled volatility, crowd building position.
+    atr = _safe_float(row, "atr_norm_14", default=-1.0)
+    if atr >= 0:    # feature present
+        if atr < 0.010:
+            score += 0.10
+        elif atr < 0.015:
+            score += 0.05
 
     return round(min(score, 1.0), 3)
 
