@@ -977,7 +977,7 @@ def run_once(paper: bool, cfg: dict):
 
         # ── Learning loops ────────────────────────────────────────────────────
         learner.maybe_recalibrate()
-        learner.maybe_retrain(universe_data, index_close)
+        learner.maybe_retrain(universe_data, index_close, variant=_active_variant)
 
     finally:
         feed.disconnect()

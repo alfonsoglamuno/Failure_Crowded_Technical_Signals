@@ -58,6 +58,14 @@ CREATE TABLE IF NOT EXISTS daily_summary (
     n_trades        INTEGER,
     paper           INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS retrain_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts              TEXT NOT NULL,      -- UTC timestamp of the retrain
+    variant         TEXT,               -- model variant (h1d_both etc.)
+    n_trades_at     INTEGER,            -- total completed trades at time of retrain
+    trigger         TEXT                -- "time" / "perf" / "manual"
+);
 """
 
 
@@ -281,3 +289,54 @@ class Journal:
             "worst_trade": round(row[4], 2),
             "best_trade": round(row[5], 2),
         }
+
+    # ── Retrain tracking ──────────────────────────────────────────────────────
+
+    def get_last_retrain_date(self) -> date | None:
+        """Return the date of the most recent retrain entry, or None if never retrained."""
+        with self._conn() as conn:
+            # Ensure table exists (migration safety for databases created before this column)
+            conn.execute("""CREATE TABLE IF NOT EXISTS retrain_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                variant TEXT,
+                n_trades_at INTEGER,
+                trigger TEXT
+            )""")
+            row = conn.execute(
+                "SELECT ts FROM retrain_log ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            return datetime.fromisoformat(row[0]).date()
+        except Exception:
+            return None
+
+    def log_retrain(self, variant: str, n_trades_at: int, trigger: str) -> None:
+        """Record a retrain event in the log."""
+        ts = datetime.utcnow().isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO retrain_log (ts, variant, n_trades_at, trigger) VALUES (?,?,?,?)",
+                (ts, variant, n_trades_at, trigger),
+            )
+
+    def get_stats_since(self, since_date: date) -> dict:
+        """
+        Return trade count and distinct trading days with completed trades
+        since `since_date` (exclusive — day after last retrain).
+        """
+        since_str = str(since_date)
+        with self._conn() as conn:
+            row = conn.execute("""
+                SELECT
+                    COUNT(*) as n_trades,
+                    COUNT(DISTINCT date) as n_trading_days
+                FROM trades
+                WHERE pnl_net IS NOT NULL
+                  AND date > ?
+            """, (since_str,)).fetchone()
+        if not row:
+            return {"n_trades": 0, "n_trading_days": 0}
+        return {"n_trades": row[0], "n_trading_days": row[1]}

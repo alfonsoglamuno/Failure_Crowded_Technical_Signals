@@ -16,7 +16,7 @@ import json
 import logging
 import sys
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
 
 import numpy as np
@@ -42,10 +42,12 @@ class AdaptiveLearner:
         self.follow_threshold = scfg["follow_threshold"]
         self.follow_disabled  = scfg.get("follow_disabled", True)
 
-        self._min_trades       = mcfg["min_trades_for_recalibration"]
-        self._retrain_days     = mcfg["retrain_frequency_days"]
-        self._perf_trigger_pct = mcfg.get("retrain_perf_trigger_pct", 0.10)
-        self._halflife_days    = mcfg.get("sample_weight_halflife_days", 252)
+        self._min_trades           = mcfg["min_trades_for_recalibration"]
+        self._retrain_days         = mcfg.get("retrain_frequency_days", 30)
+        self._retrain_min_trades   = mcfg.get("retrain_min_trades", 30)
+        self._retrain_min_tdays    = mcfg.get("retrain_min_trading_days", 15)
+        self._perf_trigger_pct     = mcfg.get("retrain_perf_trigger_pct", 0.10)
+        self._halflife_days        = mcfg.get("sample_weight_halflife_days", 252)
         self._step_up     = mcfg.get("threshold_step_up", 0.02)
         self._step_down   = mcfg.get("threshold_step_down", 0.01)
         self._win_target  = mcfg.get("win_rate_target", 0.55)
@@ -217,40 +219,64 @@ class AdaptiveLearner:
 
     # ── Slow loop: full retrain ───────────────────────────────────────────────
 
-    def maybe_retrain(self, universe_data: dict, index_close: pd.Series | None = None):
+    def maybe_retrain(self, universe_data: dict, index_close: pd.Series | None = None,
+                      variant: str = ""):
         """
-        Retrain model if the scheduled window has passed OR performance has degraded.
+        Retrain model if any scheduled window has passed OR performance has degraded.
 
-        Triggers:
-          1. Time-based  : model file is older than retrain_frequency_days (default 30 = monthly).
-          2. Perf-based  : live hit-rate has dropped more than retrain_perf_trigger_pct (default 10pp)
-                           versus the baseline recorded at the previous retrain.
-                           Rationale: market regime shifts do not follow a calendar. A sudden drop
-                           in hit-rate (e.g. crowding behaviour changes) should trigger an immediate
-                           refresh rather than waiting for the monthly window.
+        Triggers (whichever fires first):
+          1. Time-based      : ≥ retrain_frequency_days calendar days since last retrain.
+          2. Trades-based    : ≥ retrain_min_trades completed trades since last retrain.
+          3. Trading-days    : ≥ retrain_min_trading_days distinct days with trades since last retrain.
+          4. Perf-based      : live hit-rate dropped > retrain_perf_trigger_pct vs baseline.
+
+        Retrain date is stored in the journal (retrain_log table), not derived from file mtime.
+        File mtime is unreliable because the file is overwritten on every bootstrap run.
         """
-        model_path = Path(self.cfg["model"]["path"])
-
-        perf = self.journal.get_performance_summary()
-        n_trades = perf.get("n_trades", 0)
-        if n_trades < 10:
-            log.info("Retrain skipped — need ≥10 trades, have %d", n_trades)
+        perf    = self.journal.get_performance_summary()
+        n_total = perf.get("n_trades", 0)
+        if n_total < 10:
+            log.info("Retrain skipped — need ≥10 total trades, have %d", n_total)
             return
 
-        time_due = True
-        if model_path.exists():
-            age = (datetime.now() - datetime.fromtimestamp(model_path.stat().st_mtime)).days
-            time_due = age >= self._retrain_days
-            if time_due:
-                log.info("Model %d days old (>= %d) — scheduled monthly retrain",
-                         age, self._retrain_days)
+        # ── Determine last-retrain anchor ─────────────────────────────────────
+        last_retrain = self.journal.get_last_retrain_date()
+        if last_retrain is None:
+            # No retrain recorded — treat bootstrap date as anchor (use model mtime as fallback)
+            model_path = Path(self.cfg["model"]["path"])
+            if model_path.exists():
+                last_retrain = datetime.fromtimestamp(model_path.stat().st_mtime).date()
             else:
-                log.info("Model %d days old — next scheduled retrain in %d days",
-                         age, self._retrain_days - age)
+                last_retrain = date.today()  # brand new install — allow immediate retrain
 
-        # Performance degradation check
+        since = self.journal.get_stats_since(last_retrain)
+        trades_since  = since["n_trades"]
+        tdays_since   = since["n_trading_days"]
+        cal_days_since = (date.today() - last_retrain).days
+
+        # ── Retrain trigger evaluation ─────────────────────────────────────────
+        time_due   = cal_days_since  >= self._retrain_days
+        trades_due = trades_since    >= self._retrain_min_trades
+        tdays_due  = tdays_since     >= self._retrain_min_tdays
+
+        log.info(
+            "Retrain status — last: %s  cal_days: %d/%d  trades: %d/%d  tdays: %d/%d",
+            last_retrain,
+            cal_days_since,  self._retrain_days,
+            trades_since,    self._retrain_min_trades,
+            tdays_since,     self._retrain_min_tdays,
+        )
+
+        if time_due:
+            log.info("Retrain trigger: calendar days (%d >= %d)", cal_days_since, self._retrain_days)
+        if trades_due:
+            log.info("Retrain trigger: trades since retrain (%d >= %d)", trades_since, self._retrain_min_trades)
+        if tdays_due:
+            log.info("Retrain trigger: trading days since retrain (%d >= %d)", tdays_since, self._retrain_min_tdays)
+
+        # Performance degradation check (independent of schedule)
         perf_due = False
-        if self._baseline_hit_rate is not None and n_trades >= 20:
+        if self._baseline_hit_rate is not None and n_total >= 20:
             live_hit_rate = perf.get("hit_rate", 0.0)
             drop = self._baseline_hit_rate - live_hit_rate
             if drop >= self._perf_trigger_pct:
@@ -262,15 +288,20 @@ class AdaptiveLearner:
                 )
                 perf_due = True
 
-        if not time_due and not perf_due:
+        if not any([time_due, trades_due, tdays_due, perf_due]):
             return
 
-        log.info("Starting model retrain (time_due=%s  perf_due=%s)...", time_due, perf_due)
+        trigger = "perf" if perf_due and not any([time_due, trades_due, tdays_due]) else "time"
+        log.info(
+            "Starting model retrain (cal_days=%s trades=%s tdays=%s perf=%s)...",
+            time_due, trades_due, tdays_due, perf_due,
+        )
         self._retrain(universe_data, index_close)
 
-        # Record new baseline after successful retrain
+        # Record retrain in journal and update baseline
+        self.journal.log_retrain(variant=variant, n_trades_at=n_total, trigger=trigger)
         self._baseline_hit_rate = perf.get("hit_rate", 0.0)
-        log.info("Retrain baseline hit-rate set to %.1f%%", self._baseline_hit_rate * 100)
+        log.info("Retrain complete — baseline hit-rate set to %.1f%%", self._baseline_hit_rate * 100)
 
     def _retrain(self, universe_data: dict, index_close: pd.Series | None):
         try:

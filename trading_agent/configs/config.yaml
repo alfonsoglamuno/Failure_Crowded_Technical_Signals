@@ -146,10 +146,14 @@ model:
 
   # Learning loop — optimised for active paper trading (5 trades/day → fast feedback)
   max_hold_days: 3                    # Close multi-day losing positions after this many days
-  retrain_frequency_days: 30          # Full retrain monthly (Jegadeesh & Titman: 1m refresh enough)
-  retrain_perf_trigger_pct: 0.10      # Also retrain if live hit-rate drops 10pp vs baseline
+  retrain_frequency_days: 30          # Retrain after N calendar days since last retrain
+  retrain_min_trades: 30              # OR retrain after N completed trades since last retrain
+  retrain_min_trading_days: 15        # OR retrain after N distinct trading days since last retrain
+                                      # Whichever of the three triggers fires first wins.
+                                      # Avoids relying on file mtime — retrain date is stored in journal.
+  retrain_perf_trigger_pct: 0.10      # Also retrain early if live hit-rate drops 10pp vs baseline
   sample_weight_halflife_days: 252    # Exponential decay: data 1yr old carries ~50% weight
-  min_trades_for_recalibration: 10    # Recalibrate after 10 completed trades
+  min_trades_for_recalibration: 10    # Recalibrate thresholds after 10 completed trades
   threshold_step_up: 0.02             # Tighten threshold when losing
   threshold_step_down: 0.01           # Loosen when winning
   win_rate_target: 0.55               # Target hit rate

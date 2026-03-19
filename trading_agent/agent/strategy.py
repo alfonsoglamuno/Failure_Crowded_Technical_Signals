@@ -159,16 +159,29 @@ def filter_signals(
     - No hard top-N cap — position limits are enforced via max_open_positions
       and capital constraints instead.
     """
-    seen_tickers = set()
-    filtered     = []
+    seen_tickers  = set()
+    filtered      = []
+    blocked_short = 0
 
     for sig in signals:
         if sig.ticker in seen_tickers:
             continue
         if sig.trade_direction == "SELL" and not allow_short:
-            log.info("Skipping SELL for %s (long-only mode)", sig.ticker)
+            log.debug("Skipping SELL for %s (long-only mode)", sig.ticker)
+            blocked_short += 1
             continue
         seen_tickers.add(sig.ticker)
         filtered.append(sig)
+
+    if blocked_short:
+        # In long-only + follow_disabled mode the agent can only trade FADE on
+        # BEARISH alerts (= BUY contrarian).  Today's FADE signals are on bullish
+        # alerts (breakout_high → SELL) which are blocked.  If all signals are
+        # blocked this way, the answer is to run with allow_short=True or wait
+        # for bearish alerts to appear.
+        log.info(
+            "Long-only filter: %d SELL signal(s) blocked, %d BUY signal(s) pass",
+            blocked_short, len(filtered),
+        )
 
     return filtered
